@@ -5,15 +5,15 @@ var $builtinmodule = window.memoise('anvil.saml.auth', function() {
 
     var loginCallbackResolve = null;
 
-    var displayLogInModal = function() {
+    async function displayLogInModal() {
 
         var anvil = PyDefUtils.getModule("anvil");
         var appPath = Sk.ffi.remapToJs(anvil.tp$getattr(new Sk.builtin.str("app_path")));
 
-        var doLogin = function() {
+        function doLogin() {
 
             var authParams = {
-                s: window.anvilSessionToken,
+                _anvil_session: window.anvilSessionToken,
             };
 
             var authUrl = appPath + "/_/saml_auth_redirect?" + $.param(authParams);
@@ -46,7 +46,7 @@ var $builtinmodule = window.memoise('anvil.saml.auth', function() {
         if (PyDefUtils.isPopupOK()) {
             doLogin();
         } else {
-            const modal = new window.anvilModal({
+            const modal = await window.anvilModal.create({
                 id: "saml-login-modal",
                 backdrop: "static",
                 keyboard: false,
@@ -63,7 +63,8 @@ var $builtinmodule = window.memoise('anvil.saml.auth', function() {
                     { text: "Log in", style: "success", onClick: doLogin },
                 ],
             });
-            modal.show();
+            await modal.show();
+            return modal;
         }
     }
 
@@ -93,29 +94,31 @@ var $builtinmodule = window.memoise('anvil.saml.auth', function() {
         }
     }
 
-    /*!defFunction(anvil.saml.auth,!_)!2*/ "Prompt the user to log in via SAML"
-    mod["login"] = new Sk.builtin.func(function() {
+    async function login() {
 
         // TODO: Try immediate auth before we do anything else. If that fails, then...
 
         loginCallbackResolve = PyDefUtils.defer();
 
-        displayLogInModal();
+        const modal = await displayLogInModal();
 
         // TODO: Should probably have a timeout on this promise.
+        try {
+            const email = await loginCallbackResolve.promise;
+            return Sk.ffi.toPy(email);
+        } catch (e) {
+            if (e === "MODAL_CANCEL") {
+                return Sk.builtin.none.none$;
+            } else {
+                throw e;
+            }
+        } finally {
+            modal && modal.hide();
+        }
+    }
 
-        return PyDefUtils.suspensionPromise(function(resolve, reject) {
-            loginCallbackResolve.promise.then(function(email) {
-                resolve(email);
-            }).catch(function(e) {
-                if (e == "MODAL_CANCEL") {
-                    resolve(Sk.builtin.none.none$);
-                } else {
-                    reject(e);
-                }
-            });
-        });
-    });
+    /*!defFunction(anvil.saml.auth,!_)!2*/ "Prompt the user to log in via SAML";
+    mod["login"] = new Sk.builtin.func(() => PyDefUtils.suspensionFromPromise(login()));
 
     registerCallbackHandlers(window.messages);
 

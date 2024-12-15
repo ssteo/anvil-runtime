@@ -1,4 +1,5 @@
 from anvil.server import serializable_type
+import anvil
 
 
 def _wrap(value):
@@ -110,3 +111,5 @@ class WrappedList(list):
         from copy import deepcopy
 
         return self.__class__(deepcopy(list(self)))
+
+

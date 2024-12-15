@@ -1,9 +1,13 @@
 "use strict";
 
+import {getSpacingStyles, setElementSpacing} from "@runtime/runner/components-in-js/public-api/property-utils";
+
 var PyDefUtils = require("PyDefUtils");
 import { validateChild } from "./Container";
 import { getCssPrefix } from "@runtime/runner/legacy-features";
 import { isInvisibleComponent } from "./helpers";
+import {pyNone, toJs, toPy} from "@Sk";
+import {data} from "@runtime/runner/data";
 
 /*#
 id: flowpanel
@@ -44,11 +48,19 @@ description: |
 
 module.exports = (pyModule) => {
 
+    const GAP_VALUES = ["none", "tiny", "small", "medium", "large", "huge"];
+
+    const setGap = (s, e, v) => {
+        const prefix = getCssPrefix();
+        GAP_VALUES.forEach((i) => {
+            s._anvil.domNode.classList.toggle(prefix + "flow-spacing-" + i, v === i);
+        });
+    };
 
     pyModule["FlowPanel"] = PyDefUtils.mkComponentCls(pyModule, "FlowPanel", {
         base: pyModule["ClassicContainer"],
 
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(FlowPanel)!1*/ ["appearance", "user data", "layout", "tooltip"], {
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(FlowPanel)!1*/ ["appearance", "user data", "layout", "layout_spacing", "tooltip"], {
             align: /*!componentProp(FlowPanel)!1*/ {
                 name: "align",
                 important: true,
@@ -69,22 +81,59 @@ module.exports = (pyModule) => {
                     s._anvil.elements.gutter.style.justifyContent = v;
                 },
             },
-
-            spacing: /*!componentProp(FlowPanel)!1*/ {
-                name: "spacing",
-                description: "Space between components",
+            vertical_align: /*!componentProp(FlowPanel)!1*/ {
+                name: "vertical_align",
                 type: "enum",
-                options: ["none", "tiny", "small", "medium", "large", "huge"],
-                defaultValue: new Sk.builtin.str("medium"),
+                options: ["top", "middle", "bottom", "full"],
+                description: "Align this component's content",
+                defaultValue: new Sk.builtin.str("full"),
                 pyVal: true,
-                important: false,
-                priority: 0,
+                designerHint: 'align-vertical',
                 set(s, e, v) {
                     const prefix = getCssPrefix();
                     v = v.toString();
-                    ["none", "tiny", "small", "medium", "large", "huge"].forEach((i) => {
-                        s._anvil.domNode.classList.toggle(prefix + "flow-spacing-" + i, v === i);
+                    ["top", "middle", "bottom", "full"].forEach((i) => {
+                        s._anvil.domNode.classList.toggle(prefix + "vertical-align-" + i, v === i);
                     });
+                },
+            },
+
+            spacing: {
+                set(s, e, v) {
+                    if (GAP_VALUES.includes(v?.toString())) {
+                        s._anvil.props.gap = v;
+                        setGap(s, e, v);
+                        setElementSpacing(e[0], null);
+                    } else {
+                        setElementSpacing(e[0], v);
+                    }
+                },
+            },
+
+            gap: /*!componentProp(FlowPanel)!1*/ {
+                name: "gap",
+                description: "Gap between components",
+                type: "enum",
+                options: ["none", "tiny", "small", "medium", "large", "huge"],
+                defaultValue: Sk.builtin.none.none$, // Means look at spacing prop, otherwise use "medium". pyNone breaks gendoc.
+                important: false,
+                priority: 0,
+                get(s, e) {
+                    const currentPyGap = s._anvil.props.gap;
+
+                    if (currentPyGap && currentPyGap !== pyNone) {
+                        return currentPyGap;
+                    } else {
+                        const currentPySpacing = s._anvil.props.spacing;
+                        if (GAP_VALUES.includes(currentPySpacing.toString())) {
+                            return currentPySpacing;
+                        } else {
+                            return toPy("medium");
+                        }
+                    }
+                },
+                set(s, e, v) {
+                    setGap(s, e, v);
                 },
             },
         }),
@@ -109,9 +158,20 @@ module.exports = (pyModule) => {
             }
         ],
 
-        element({ align, spacing, ...props }) {
+        element({ align, spacing, gap, vertical_align, ...props }) {
             const prefix = getCssPrefix();
-            spacing = prefix + "flow-spacing-" + spacing.toString();
+
+            let gapClass = "flow-spacing-medium";
+            const spacingJs = toJs(spacing);
+            const actualGapJs = toJs(gap) ?? spacingJs;
+            if (GAP_VALUES.includes(actualGapJs)) {
+                gapClass = prefix + "flow-spacing-" + actualGapJs;
+            }
+
+            if (!GAP_VALUES.includes(spacingJs)) {
+                props.spacing = spacing;
+            }
+
             align =
                 "justify-content: " +
                 ({
@@ -120,16 +180,17 @@ module.exports = (pyModule) => {
                     justify: "space-between",
                 }[align.toString()] || "flex-start") +
                 ";";
-            
+            vertical_align = prefix + "vertical-align-" + (vertical_align.toString() || 'top');
+
             return (
-                <PyDefUtils.OuterElement className={`${prefix}flow-panel anvil-container anvil-container-overflow ${spacing}`} {...props}>
+                <PyDefUtils.OuterElement className={`${prefix}flow-panel anvil-container anvil-container-overflow ${gapClass} ${vertical_align}`} {...props}>
                     <div refName="gutter" className={`${prefix}flow-panel-gutter`} style={align} />
                 </PyDefUtils.OuterElement>
             );
         },
 
         locals($loc) {
-            const ContainerElement = ({ visible, width, expand }) => {
+            const ContainerElement = ({ visible=true, width, expand }) => {
                 const prefix = getCssPrefix();
                 visible = !Sk.misceval.isTrue(visible) ? ` ${prefix}visible-false` : "";
                 let style = "";
@@ -139,7 +200,7 @@ module.exports = (pyModule) => {
                 if (expand) {
                     style += "flex: 1;";
                 }
-                return <div className={`${prefix}flow-panel-item anvil-always-inline-container ${prefix}hide-with-component` + visible} style={style}></div>;
+                return <div className={`${prefix}flow-panel-item anvil-always-inline-container` + visible} style={style}></div>;
             };
 
             /*!defMethod(_,component,[index=],[width=],[expand=])!2*/ "Add a component to this panel. Optionally specify the position in the panel to add it, or the width to apply to components that can't self-size width-wise."
@@ -154,10 +215,8 @@ module.exports = (pyModule) => {
                             return pyModule["ClassicContainer"]._doAddComponent(self, component);
                         }
                         const gutter = self._anvil.elements.gutter;
-                        // TODO: How should components signal visibility to their parents?
-                        const visible = (component._anvil && ("visible" in component._anvil.propMap)) ? component._anvil.getProp("visible") : Sk.builtin.bool.true$;
                         const width = domNode.classList.contains("anvil-inlinable") ? "" : kwargs["width"] || "auto";
-                        const [containerElement] = <ContainerElement visible={visible} width={width} expand={expand} />;
+                        const [containerElement] = <ContainerElement width={width} expand={expand} />;
                         containerElement.appendChild(domNode);
                         if (typeof idx === "number" && idx < gutter.children.length) {
                             gutter.insertBefore(containerElement, gutter.children[idx]);
@@ -170,13 +229,15 @@ module.exports = (pyModule) => {
                                 $(domNode).detach();
                                 containerElement.remove();
                             },
+                            setVisibility(v) {
+                                containerElement.classList.toggle(getCssPrefix() + "visible-false", !v);
+                            }
                         });
                     }
                 );
             });
         },
     });
-
 };
 
 /*!defClass(anvil,FlowPanel,Container)!*/

@@ -1,5 +1,7 @@
 "use strict";
 
+import { getUnsetSpacing, setElementMargin, setElementPadding } from "@runtime/runner/components-in-js/public-api/property-utils";
+
 var PyDefUtils = require("PyDefUtils");
 import { getCssPrefix, getInlineStyles } from "@runtime/runner/legacy-features";
 import { setHandled } from "./events";
@@ -27,7 +29,7 @@ module.exports = (pyModule) => {
     const inlineStyle = getInlineStyles("checkbox");
 
     pyModule["CheckBox"] = PyDefUtils.mkComponentCls(pyModule, "CheckBox", {
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(CheckBox)!2*/ ["interaction", "layout", "text", "appearance", "tooltip", "user data"], {
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(CheckBox)!2*/ ["interaction", "layout", "layout_spacing", "text", "appearance", "tooltip", "user data"], {
             bold: {
                 set(s, e, v) {
                     v = isTrue(v);
@@ -51,10 +53,11 @@ module.exports = (pyModule) => {
                 name: "checked",
                 type: "boolean",
                 description: "The status of the checkbox",
+                designerHint: "toggle",
                 suggested: true,
                 pyVal: true,
-				important: true,
-				priority: 10,
+                important: true,
+                priority: 10,
                 exampleValue: true,
                 defaultValue: Sk.builtin.bool.false$,
                 allowBindingWriteback: true,
@@ -90,7 +93,19 @@ module.exports = (pyModule) => {
                     }
                 },
             },
-
+            text: {
+                group: undefined,
+                inlineEditElement: "text",
+            },
+            spacing: {
+                set(s, e, v) {
+                    setElementMargin(e[0], v?.margin);
+                    setElementPadding(s._anvil.elements.label, v?.padding);
+                },
+                getUnset(s, e, currentValue) {
+                    return getUnsetSpacing(e[0], s._anvil.elements.label, currentValue);
+                }
+            },
         }),
 
         events: PyDefUtils.assembleGroupEvents(/*!componentEvents()!2*/ "CheckBox", ["universal"], {
@@ -116,18 +131,19 @@ module.exports = (pyModule) => {
             if (isTrue(font_size)) {
                 labelStyle += " font-size: " + font_size.toString() + "px;";
             }
+            labelStyle += PyDefUtils.getPaddingStyle({spacing: props.spacing});
             const inputAttrs = {};
             if (isTrue(checked)) {
                 inputAttrs.checked = "";
             }
             if (!isTrue(props.enabled)) {
-                inputAttrs.disabled = "";
+                inputAttrs.disabled = "" ;
             }
             return (
-                <PyDefUtils.OuterElement className="anvil-inlinable" {...props}>
+                <PyDefUtils.OuterElement className="anvil-inlinable" includePadding={false} {...props}>
                     <div refName="checkbox" className={prefix + "checkbox"}>
                         <label refName="label" style={inlineStyle + labelStyle}>
-                            <input refName="input" className={`${prefix}to-disable`}type="checkbox" {...inputAttrs} />
+                            <input refName="input" className={`${prefix}to-disable`} type="checkbox" {...inputAttrs} />
                             <span refName="text" style={"display: inline-block; min-height: 1em;" + textStyle}>
                                 {Sk.builtin.checkNone(props.text) ? "" : props.text.toString()}
                             </span>
@@ -147,6 +163,17 @@ module.exports = (pyModule) => {
                 $(self._anvil.elements.label).on("click", (e) => {
                     setHandled(e);
                 });
+                if (ANVIL_IN_DESIGNER) {
+                    Object.defineProperty(self._anvil, "inlineEditing", {
+                        set(v) {
+                            // the programmatic link between label and input does not exist for [type=hidden]
+                            // https://developer.mozilla.org/en-US/docs/Web/HTML/Element/label
+                            // The label would normally swallow mouse events (and fire change events)
+                            // But we need mouse events to behave when inline editing (e.g. cursor changing position)
+                            self._anvil.elements.input.type = v ? "hidden" : "checkbox";
+                        }
+                    });
+                }
             });
 
             /*!defMethod(_)!2*/ ("Set the keyboard focus to this component");

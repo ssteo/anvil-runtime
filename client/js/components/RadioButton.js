@@ -2,6 +2,7 @@
 
 import { getCssPrefix, getInlineStyles } from "@runtime/runner/legacy-features";
 import { setHandled } from "./events";
+import { getUnsetSpacing, setElementMargin, setElementPadding } from "@runtime/runner/components-in-js/public-api/property-utils";
 var PyDefUtils = require("PyDefUtils");
 
 /*#
@@ -51,7 +52,7 @@ module.exports = (pyModule) => {
     const inlineStyle = getInlineStyles("radio");
 
     pyModule["RadioButton"] = PyDefUtils.mkComponentCls(pyModule, "RadioButton", {
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(RadioButton)!2*/ ["text", "layout", "interaction", "appearance", "tooltip", "user data"], {
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(RadioButton)!2*/ ["text", "layout", "layout_spacing", "interaction", "appearance", "tooltip", "user data"], {
             text: {
                 set(s, e, v) {
                     v = Sk.builtin.checkNone(v) ? "" : v.toString();
@@ -61,6 +62,8 @@ module.exports = (pyModule) => {
                         s._anvil.elements.text.innerHTML = "&nbsp;";
                     }
                 },
+                group: undefined,
+                inlineEditElement: "text",
             },
             bold: {
                 set(s, e, v) {
@@ -76,6 +79,7 @@ module.exports = (pyModule) => {
                 name: "selected",
                 type: "boolean",
                 suggested: true,
+                designerHint: "toggle",
                 pyVal: true,
                 defaultValue: Sk.builtin.bool.false$,
                 description: "The status of the radio button",
@@ -115,6 +119,15 @@ module.exports = (pyModule) => {
                     return Sk.ffi.toPy(s._anvil.elements.input.name);
                 },
             },
+            spacing: {
+                set(s, e, v) {
+                    setElementMargin(e[0], v?.margin);
+                    setElementPadding(s._anvil.elements.label, v?.padding);
+                },
+                getUnset(s, e, currentValue) {
+                    return getUnsetSpacing(e[0], s._anvil.elements.label, currentValue);
+                }
+            },
         }),
 
         events: PyDefUtils.assembleGroupEvents("radio button", /*!componentEvents(RadioButton)!1*/ ["universal"], {
@@ -139,9 +152,10 @@ module.exports = (pyModule) => {
             if (!isTrue(props.enabled)) {
                 inputAttrs.disabled = "";
             }
+            const labelStyle = PyDefUtils.getPaddingStyle({spacing: props.spacing});
             return (
-                <PyDefUtils.OuterElement refName="outer" className={prefix+"radio anvil-inlinable"} {...props}>
-                    <label refName="label" style={inlineStyle}>
+                <PyDefUtils.OuterElement refName="outer" className={prefix+"radio anvil-inlinable"} includePadding={false} {...props}>
+                    <label refName="label" style={inlineStyle + labelStyle}>
                         <input
                             refName="input"
                             className={`${prefix}to-disable`}
@@ -168,6 +182,14 @@ module.exports = (pyModule) => {
                 $(self._anvil.elements.label).on("click", (e) => {
                     setHandled(e);
                 });
+                if (ANVIL_IN_DESIGNER) {
+                    Object.defineProperty(self._anvil, "inlineEditing", {
+                        set(v) {
+                            // see checkbox.js
+                            self._anvil.elements.input.type = v ? "hidden" : "radio";
+                        }
+                    });
+                }
             });
 
             /*!defMethod(str)!2*/ "returns the value of the button in the group which is pressed."

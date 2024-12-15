@@ -6,13 +6,15 @@
 
 (defonce data-path (or (System/getenv "ANVIL_DATA_DIRECTORY") "/data"))
 
-(defonce error-log-path (str data-path "/error.log"))
+(defonce error-log-path (or (System/getenv "ANVIL_ERROR_LOG_PATH") (str data-path "/error.log")))
 
 (defonce live-object-mac-path (str data-path "/anvil-live-object-key.txt"))
 
 (defonce saml-paths {:private-key (str data-path "/anvil-saml-private-key.pem")
                      :public-key  (str data-path "/anvil-saml-public-key.pem")
                      :certificate (str data-path "/anvil-saml-cert.pem")})
+
+(defonce dont-confirm-emails-during-auth? false)
 
 (def twilio-config nil)
 
@@ -53,9 +55,7 @@
 
 (def max-websocket-payload 16777216)
 
-(def max-http-body 16777216)
-
-(def runtime-session-expire-seconds (* 30 60))
+(def max-http-body 268435456) ;; 256 MB
 
 (def anvil-version "<unknown>")
 
@@ -67,6 +67,10 @@
 (def permit-url-session-tokens? true)
 
 (def regular-thread-dumps? false)
+
+(def default-session-expiry-timeout-mins 30)
+
+(def override-session-expiry-timeout-mins nil)
 
 (defn set-config! [hook-map]
   (let [vars (-> (ns-publics 'anvil.runtime.conf)

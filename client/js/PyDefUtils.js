@@ -1,104 +1,118 @@
 "use strict";
 
-const { pyTypeError, pyObject, toPy, Suspension, pyFunc, pyList, pyDict, pyStr, pyCallOrSuspend } = require("./@Sk");
+const {
+    Args,
+    Kws,
+    Suspension,
+    pyCall,
+    pyCallOrSuspend,
+    pyCallable,
+    pyDict,
+    pyList,
+    pyObject,
+    pyStaticMethod,
+    pyStr,
+    pyTuple,
+    pyTypeError,
+    remapToJsOrWrap,
+    toJs,
+    toPy,
+} = require("@Sk");
+const { notifyVisibilityChange } = require("./components/Component");
+const {
+    getMarginStyles,
+    getPaddingStyles,
+    getUnsetMargin,
+    getUnsetPadding,
+    getUnsetSpacing,
+    getUnsetValue,
+    setElementMargin,
+    setElementPadding,
+    setElementSpacing,
+    styleObjectToString,
+} = require("./runner/components-in-js/public-api/property-utils");
 const { getCssPrefix, hasLegacyDict } = require("./runner/legacy-features");
-const { s_anvil_events, objectToKwargs, s_raise_event, pyTryFinally } = require("./runner/py-util");
+const { funcFastCall, getImportedModule, kwsToObj, pyTryFinally, s_raise_event, jsObjToKws } = require("./runner/py-util");
 const { defer } = require("./utils");
 
 var PyDefUtils = {};
 
-// A little hack to make a Javascript-implemented Python module
-// available in Skulpt without doing string concatenation and then eval() on it (ew!).
-// This meddles with Skulpt internals and is liable to break.
-// It doesn't handle dotted names
+/**
+ * A little hack to make a Javascript-implemented Python module
+ * This meddles with Skulpt internals and is liable to break.
+ * It doesn't handle dotted names
+ * 
+ * @param {string} name 
+ * @param {{[attr: string]: pyObject}} modvars 
+ */
 PyDefUtils.loadModule = function(name, modvars) {
 
-    var pyModule = new Sk.builtin.module();
+    const pyModule = new Sk.builtin.module();
     Sk.sysmodules.mp$ass_subscript(new Sk.builtin.str(name), pyModule);
     pyModule.$js = "/* source code not available */";
     pyModule.$d = modvars;
 
     // If it's a submodule, we assume the parent has already
     // been loaded, and add it as an attribute to the parent
-    var dottedSplit = /^(.*)\.([^.]+)$/.exec(name);
+    const dottedSplit = /^(.*)\.([^.]+)$/.exec(name);
     if (dottedSplit) {
-        var parent = PyDefUtils.getModule(dottedSplit[1]);
+        const parent = PyDefUtils.getModule(dottedSplit[1]);
         parent.$d[dottedSplit[2]] = pyModule;
     }
-}
+};
 
 // Get a previously-loaded module. Throws exception if not already loaded.
-PyDefUtils.getModule = function(name) {
-    return Sk.sysmodules.mp$subscript(new Sk.builtin.str(name));
-}
+PyDefUtils.getModule = getImportedModule;
 
-PyDefUtils.staticmethod = function(pyFunc) {
-    return new Sk.builtin.staticmethod(pyFunc);
-}
+PyDefUtils.staticmethod = (pyFunc) => new pyStaticMethod(pyFunc);
 
-PyDefUtils.keywordArrayToHashMap = function (pyKwarray) {
-    const kwargs = {};
-    for (let i = 0; i < pyKwarray.length; i += 2) {
-        kwargs[pyKwarray[i].toString()] = pyKwarray[i + 1];
-    }
-    return kwargs;
-};
+PyDefUtils.keywordArrayToHashMap = kwsToObj; 
 
 // Skulpt functions that take keyword arguments must be marked with the
 // co_kwargs property, and will receive an array of alternating keys and values
 // as their first argument. withKwargs() takes a Javascript function that
 // expects a Javascript object of keyword keys/values as its first argument,
 // and turns it into the sort of function Skulpt will accept.
-PyDefUtils.withKwargs = function(f) {
-    var rf = function(pyKwarray, more_function_args) {
-        var kwargs = {}
-        for(var i = 0; i < pyKwarray.length - 1; i+=2)
-            kwargs[pyKwarray[i].v] = Sk.ffi.remapToJs(pyKwarray[i+1]);
+PyDefUtils.withKwargs = function (f) {
+    var rf = function (pyKwarray, more_function_args) {
+        var kwargs = {};
+        for (var i = 0; i < pyKwarray.length - 1; i += 2) kwargs[pyKwarray[i].v] = Sk.ffi.remapToJs(pyKwarray[i + 1]);
 
         return f.apply(this, [kwargs].concat(Array.prototype.slice.call(arguments, 1)));
     };
     rf.co_kwargs = true;
     return rf;
-}
+};
 
-PyDefUtils.funcWithKwargs = function(f) {
+PyDefUtils.funcWithKwargs = function (f) {
     return new Sk.builtin.func(PyDefUtils.withKwargs(f));
-}
+};
 
 // Sometimes, you don't want the kwargs transformed into Javascript.
 // Just mark the function as taking kwargs.
-PyDefUtils.withRawKwargs = function(f) {
+PyDefUtils.withRawKwargs = function (f) {
     f.co_kwargs = true;
     return f;
-}
+};
 
-PyDefUtils.funcWithRawKwargsDict = function(f) {
-    var rf = function(pyKwarray, more_function_args) {
+PyDefUtils.funcWithRawKwargsDict = function (f) {
+    var rf = function (pyKwarray, more_function_args) {
         const kwargs = PyDefUtils.keywordArrayToHashMap(pyKwarray);
         return f.apply(this, [kwargs].concat(Array.prototype.slice.call(arguments, 1)));
     };
     rf.co_kwargs = true;
     return new Sk.builtin.func(rf);
-}
-
-
-/**
- * @template {pyObject | Suspension} T 
- * @template {import("./@Sk").Args} A
- * @param {(args: A, kws?: import("./@Sk").Kws) => T} f 
- * @returns {pyFunc<T>}
- */
-PyDefUtils.funcFastCall = (f) => {
-    f.co_fastcall = 1;
-    return new Sk.builtin.func(f);
 };
 
 
+/** @deprecated use funcFastCall from py-util */
+PyDefUtils.funcFastCall = funcFastCall;
+
 /** @deprecated use pyCall from Sk module */
-PyDefUtils.pyCall = Sk.misceval.callsimArray;
+PyDefUtils.pyCall = pyCall;
 
 /** @deprecated use pyCallOrSuspend from Sk module */
-PyDefUtils.pyCallOrSuspend = Sk.misceval.callsimOrSuspendArray;
+PyDefUtils.pyCallOrSuspend = pyCallOrSuspend;
 
 
 // Remap Python to JS, with special handlers for certain types
@@ -124,7 +138,7 @@ var remapToJSWithWrapper = function(obj, keySeq, unknownTypeWrapper, firstLookWr
             if (!(k instanceof Sk.builtin.str)) {
                 throw new Sk.builtin.TypeError("Cannot use '" + k.tp$name + "' objects as the key in a dict when sending to a server-side module; only string keys are allowed (arguments"+pythonifyPath(keySeq)+")");
             }
-            var jsk = Sk.ffi.remapToJs(k);
+            var jsk = Sk.ffi.toJs(k);
             keySeq.push(jsk);
             ret[jsk] = remapToJSWithWrapper(obj.mp$subscript(k), keySeq, unknownTypeWrapper, firstLookWrapper);
             keySeq.pop();
@@ -188,6 +202,7 @@ const getInheritedEventsTypes = (events, baseEvents) => {
     return eventTypes;
 };
 
+/** Should only be used for classic components */
 PyDefUtils.mkComponentCls = function mkComponentCls(anvilModule, name, params) {
     let { base, properties, events, layouts, element, locals, kwargs, slots=true } = params;
 
@@ -207,7 +222,6 @@ PyDefUtils.mkComponentCls = function mkComponentCls(anvilModule, name, params) {
     properties ??= [];
     locals ??= () => {};
 
-    const eventTypes = getInheritedEventsTypes(events, bases[0]?.prototype?._anvilClassic$eventTypes ?? {});
 
     const ComponentCls = Sk.misceval.buildClass(
         anvilModule,
@@ -217,9 +231,6 @@ PyDefUtils.mkComponentCls = function mkComponentCls(anvilModule, name, params) {
             }
             locals($loc);
             PyDefUtils.mkGettersSetters($loc, properties, anvilModule);
-            if (eventTypes) {
-                $loc[s_anvil_events] = toPy(Object.values(eventTypes));
-            }
         },
         name,
         bases,
@@ -288,14 +299,16 @@ PyDefUtils.initClassicComponentClassPrototype = function (cls, options = {}) {
             "priority",
             "hidden",
             "deprecated",
+            "deprecateFromRuntimeVersion",
             "pyVal",
             "hideFromDesigner",
             "allowBindingWriteback",
             "showInDesignerWhen",
             "inlineEditElement",
             "designerHint",
-            "iconset",
+            "iconsets",
             "allowCustomValue",
+            "accept",
         ].forEach((prop) => {
             if (entry[prop]) {
                 propType[prop] = entry[prop];
@@ -406,7 +419,11 @@ PyDefUtils.h = PyDefUtils.createElement = function createElement (tag, _props, .
 
     Object.keys(props).forEach((propName) => {
         const propValue = props[propName];
-        element.setAttribute(propName, propValue == null ? propValue : propValue.toString() );
+        if (propName === "value") {
+            element.value = propValue;
+        } else {
+            element.setAttribute(propName, propValue == null ? propValue : propValue.toString() );
+        }
     });
 
     _children.forEach((child) => {
@@ -448,6 +465,7 @@ PyDefUtils.suspensionPromise = function(fn) {
     return PyDefUtils.suspensionFromPromise(p);
 }
 
+/** @type {{[suspensionType: string]: (s: Suspension) => (Promise<any> | null | undefined | void)}} */
 PyDefUtils.suspensionHandlers = {
     timer: function(r) {
         return new Promise(function(resolve, reject) {
@@ -467,11 +485,15 @@ PyDefUtils.callAsyncWithoutDefaultError = function() {
 
 /**
  * @template {pyObject} T
- * @param  {...any} args
+ * @param {pyObject | pyCallable<pyObject | Suspension>} func
+ * @param {pyDict=} kwDict
+ * @param {pyTuple=} varargseq
+ * @param {Kws=} kws
+ * @param {Args} args
  * @returns {Promise<T>}
  */
-PyDefUtils.callAsync = (...args) =>
-    Sk.misceval.callAsync(PyDefUtils.suspensionHandlers, ...args).catch((e) => {
+PyDefUtils.callAsync = (func, kwDict, varargseq, kws, ...args) =>
+    Sk.misceval.callAsync(PyDefUtils.suspensionHandlers, func, kwDict, varargseq, kws, ...args).catch((e) => {
         // unhandled errors are caught by window.onunhandledrejection
         throw e;
     });
@@ -486,7 +508,8 @@ PyDefUtils.callAsync = (...args) =>
 // but since the next optional suspension we hit
 // will be the result of long running code we only ignore the first one.
 function ignoreFirstOptionalSuspension(susp) {
-    if (susp instanceof Sk.misceval.Suspension && susp.optional) {
+    // TODO: Work out whether this will affect optional debug suspensions
+    if (susp instanceof Sk.misceval.Suspension && susp.optional && susp.data.type !== "Sk.debug") {
         susp = susp.resume();
     }
     return susp;
@@ -500,7 +523,7 @@ function ignoreFirstOptionalSuspension(susp) {
  */
 PyDefUtils.asyncToPromise = (fn) => {
     const suspendablefn = () => ignoreFirstOptionalSuspension(fn());
-    return Sk.misceval.asyncToPromise(suspendablefn).catch((e) => {
+    return Sk.misceval.asyncToPromise(suspendablefn, PyDefUtils.suspensionHandlers).catch((e) => {
         // unhandled errors are caught by window.onunhandledrejection
         throw e;
     });
@@ -511,7 +534,7 @@ PyDefUtils.asyncToPromise = (fn) => {
 // (expects a Javascript object as first parameter, keys are JS, vals are Python if pyVal is true, otherwise JS.
 /** @deprecated */
 PyDefUtils.raiseEventOrSuspend = function(eventArgs, self, eventName) {
-    return pyCallOrSuspend(self.tp$getattr(s_raise_event), [new pyStr(eventName)], objectToKwargs(eventArgs));
+    return pyCallOrSuspend(self.tp$getattr(s_raise_event), [new pyStr(eventName)], jsObjToKws(eventArgs));
 };
 
 PyDefUtils.raiseEventAsync = function(eventArgs, self, eventName) {
@@ -754,18 +777,42 @@ PyDefUtils.getColor = (v) => {
     }
 };
 
-PyDefUtils.loadScript = (url) => {
+/**
+ * 
+ * @param {string} url 
+ * @param {() => void} [onload] 
+ * @returns {Promise}
+ */
+PyDefUtils.loadScript = (url, onload) => {
     const script = document.createElement("script");
     script.src = url;
     const p = new Promise((resolve, reject) => {
-        script.onload = resolve;
+        script.onload = () => {
+            resolve(null);
+            onload?.();
+        };
         script.onerror = reject;
     });
     document.body.appendChild(script);
     return p;
 };
 
-PyDefUtils.getOuterStyle = function getOuterStyle({ align, font_size, font, bold, italic, underline, background, foreground, border, height, width }) {
+PyDefUtils.getPaddingStyle = function getPaddingStyle({padding, spacing}) {
+    const style = {};
+
+    if (isTrue(padding)) {
+        Object.assign(style, getPaddingStyles(toJs(padding)));
+    } else if (isTrue(spacing)) {
+        const p = toJs(spacing).padding;
+        if (p) {
+            Object.assign(style, getPaddingStyles(p));
+        }
+    }
+
+    return styleObjectToString(style);
+};
+
+PyDefUtils.getOuterStyle = function getOuterStyle({ align, font_size, font, bold, italic, underline, background, foreground, border, border_radius, height, width, spacing, margin, padding }, includePadding = true) {
     const style = {};
     if (isTrue(align)) {
         style["text-align"] = align.toString();
@@ -795,6 +842,9 @@ PyDefUtils.getOuterStyle = function getOuterStyle({ align, font_size, font, bold
     if (isTrue(border)) {
         style["border"] = border.toString();
     }
+    if (isTrue(border_radius)) {
+        style["border-radius"] = PyDefUtils.cssLength(border_radius.toString());
+    }
     if (isTrue(height)) {
         style["height"] = PyDefUtils.cssLength(height.toString()); 
     }
@@ -802,12 +852,25 @@ PyDefUtils.getOuterStyle = function getOuterStyle({ align, font_size, font, bold
         style["width"] = PyDefUtils.cssLength(width.toString());
     }
 
-    const ret = Object.keys(style)
-        .map((key) => key + ": " + style[key])
-        .join("; ");
-    return ret ? ret + ";" : ret;
+    if (isTrue(spacing)) {
+        const jsSpacing = toJs(spacing);
+        if (jsSpacing.margin) {
+            Object.assign(style, getMarginStyles(jsSpacing.margin));
+        }
+        if (includePadding && jsSpacing.padding) {
+            Object.assign(style, getPaddingStyles(jsSpacing.padding));
+        }
+    } else {
+        if (isTrue(margin)) {
+            Object.assign(style, getMarginStyles(toJs(margin)));
+        }
+        if (includePadding && isTrue(padding)) {
+            Object.assign(style, getPaddingStyles(toJs(padding)));
+        }
+    }
 
-}
+    return styleObjectToString(style);
+};
 
 PyDefUtils.getOuterAttrs = function getOuterAttrs ({tooltip, source, role, enabled}) {
     const attrs = {};
@@ -856,15 +919,16 @@ PyDefUtils.IconComponent = ({side, icon, icon_align}) => {
     return <i refName={refName} className={`anvil-component-icon ${side} ${iconClass} ${icon_align}`}/>;
 }
 
-PyDefUtils.OuterElement = ({refName, style, className, ...props}, ...children) => {
+PyDefUtils.OuterElement = ({refName, includePadding=true, style, className, ...props}, ...children) => {
     const outerClass = PyDefUtils.getOuterClass(props) + (className ? " " + className : "");
-    const outerStyle = PyDefUtils.getOuterStyle(props) + (style ? " " + style : "");
+    const outerStyle = PyDefUtils.getOuterStyle(props, includePadding) + (style ? " " + style : "");
     const outerAttrs = PyDefUtils.getOuterAttrs(props);
     return (
         <div refName={refName || "outer"} className={outerClass} style={outerStyle} {...outerAttrs} children={children}/>
     );
 
-}
+};
+
 
 
 /*!propGroups()!1*/
@@ -917,6 +981,13 @@ var propertyGroups = {
             set(s, e, v) {
                 v = Sk.ffi.remapToJs(v);
                 e.css("font-size", typeof v === "number" ? v + "px" : "");
+            },
+            getUnset(s, e, currentValue) {
+                const el = e[0];
+                const jsVal = toJs(currentValue);
+                if (jsVal === null || jsVal === undefined || jsVal === "") {
+                    return getUnsetValue(el, "font-size");
+                }
             },
         },
         font: {
@@ -973,7 +1044,7 @@ var propertyGroups = {
             name: "icon",
             type: "icon",
 
-            iconset: "font-awesome-4.7.0",
+            iconsets: ["font-awesome-4.7.0"],
 
             defaultValue: Sk.builtin.str.$empty,
             exampleValue: "fa:user",
@@ -1004,7 +1075,7 @@ var propertyGroups = {
                         e.addClass("anvil-component-icon-present");
                     }
                 } else {
-                    console.log(v);
+                    // console.log(v);
                 }
 
                 const iconKeys = Object.keys(elements).filter((key) => key.startsWith("icon"));
@@ -1111,13 +1182,7 @@ var propertyGroups = {
                 // designer and runner.
                 const visible = isTrue(v);
                 e.toggleClass(getCssPrefix() + "visible-false", !visible);
-                s._anvil.parent?.setVisibility?.(visible);
-                s._Component.lastVisibility = visible;
-                if (visible) {
-                    // Trigger events for components that need to update themselves when visible
-                    // (eg Maps, Canvas)
-                    return s._anvil.shownOnPage();
-                }
+                return notifyVisibilityChange(s, visible);
             },
         },
         role: {
@@ -1149,13 +1214,7 @@ var propertyGroups = {
                 // designer and runner.
                 const visible = isTrue(v);
                 e.toggleClass(getCssPrefix() + "visible-false", !visible);
-                s._anvil.parent?.setVisibility?.(visible);
-                s._Component.lastVisibility = visible;
-                if (visible) {
-                    // Trigger events for components that need to update themselves when visible
-                    // (eg Maps, Canvas)
-                    return s._anvil.shownOnPage();
-                }
+                return notifyVisibilityChange(s, visible);
             },
         },
     },
@@ -1222,6 +1281,7 @@ var propertyGroups = {
             options: ["none", "small", "medium", "large"],
             defaultValue: new Sk.builtin.str("small"),
             pyVal: true,
+            deprecateFromRuntimeV3: true, // Once you have margins, this is no longer needed. But we can't remove it entirely, because people might have used it. Hide from designer, allow override via margin property.
             description: "The vertical space above this component.",
             set(s, e, v) {
                 v = v.toString();
@@ -1242,6 +1302,7 @@ var propertyGroups = {
             options: ["none", "small", "medium", "large"],
             defaultValue: new Sk.builtin.str("small"),
             pyVal: true,
+            deprecateFromRuntimeV3: true, // Once you have margins, this is no longer needed. But we can't remove it entirely, because people might have used it. Hide from designer, allow override via margin property.
             description: "The vertical space below this component.",
             set(s, e, v) {
                 v = v.toString();
@@ -1256,6 +1317,60 @@ var propertyGroups = {
                 }
             },
         },
+    },
+
+    layout_spacing: {
+        spacing: {
+            group: "layout", // Override group for this property
+            name: "spacing",
+            type: "spacing",
+            description: "Margin and padding for this container. Only available in apps that have been migrated to use Layouts.",
+            defaultValue: Sk.builtin.none.none$,
+            important: true,
+            priority: 0,
+            set(s, e, v) {
+                setElementSpacing(e[0], v);
+            },
+            getUnset(s, e, currentValue) {
+                return getUnsetSpacing(e[0], e[0], currentValue);
+            },
+        }
+    },
+
+    layout_margin: {
+        margin: {
+            group: "layout", // Override group for this property
+            name: "margin",
+            type: "margin",
+            description: "Margin for this component. Only available in apps that have been migrated to use Layouts.",
+            defaultValue: Sk.builtin.none.none$,
+            important: true,
+            priority: 0,
+            set(s, e, v) {
+                setElementMargin(e[0], v);
+            },
+            getUnset(s, e, v) {
+                return getUnsetMargin(e[0], v);
+            },
+        }
+    },
+
+    layout_padding: {
+        padding: {
+            group: "layout", // Override group for this property
+            name: "padding",
+            type: "padding",
+            description: "Padding for this component. Only available in apps that have been migrated to use Layouts.",
+            defaultValue: Sk.builtin.none.none$,
+            important: true,
+            priority: 0,
+            set(s, e, v) {
+                setElementPadding(e[0], v);
+            },
+            getUnset(s, e, v) {
+                return getUnsetPadding(e[0], v);
+            },
+        }
     },
 
     containers: {
@@ -1326,6 +1441,8 @@ var propertyGroups = {
             defaultValue: Sk.builtin.bool.true$,
             pyVal: true,
             mapProp: true,
+            // NB: we don't need to worry about notifying parent of visibility
+            // a map overlay can only be a child of a Google Map and it doesn't care
             set: PyDefUtils.mapSetter("visible", isTrue),
             get: PyDefUtils.mapGetter("visible", Sk.builtin.bool),
         },
@@ -1504,6 +1621,7 @@ var eventGroups = {
                     "A dictionary of keys including 'shift', 'alt', 'ctrl', 'meta'. " +
                     "Each key's value is a boolean indicating if it was pressed during the click event. " +
                     "The meta key on a mac is the Command key",
+                important: false,
             }],
             important: true,
         }
@@ -1595,7 +1713,7 @@ PyDefUtils.assembleGroups = function assembleGroups(groups, componentName, group
         const groupProps = groups[groupName];
         for (let i in groupProps) {
             let prop = groupProps[i];
-            prop.group = groupName;
+            prop.group ||= groupName; // Allow properties defined in one group (above) to actually appear in another group
             const override = overrides[prop.name] || {};
             prop = { ...prop, ...override };
             if (prop.description) {
@@ -1797,19 +1915,23 @@ PyDefUtils.addHeightHandle = function(_anvil) {
 };
 
 // Problem: We can only pop up windows (eg Google auth) in response to synchronous events.
-// Track whether we are currently executing a synchronous event.
-var popupOK = false;
-PyDefUtils.funcWithPopupOK = function(f) {
-    return function() {
+// Track whether we are currently executing a synchronous click event.
+let popupOK = false;
+document.addEventListener(
+    "click",
+    () => {
         popupOK = true;
-        try {
-            return f.apply(this, arguments);
-        } finally {
-            popupOK = false;
-        }
-    };
-}
-PyDefUtils.isPopupOK = function() { return popupOK; }
+        setTimeout(() => {
+            popupOK = false; // fail safe incase the bubble phase stopped propagation
+        });
+    },
+    true
+);
+document.addEventListener("click", () => {
+    popupOK = false;
+});
+
+PyDefUtils.isPopupOK = () => popupOK;
 
 
 // A common pattern is turning Media objects into a URL we can feed to
@@ -1995,36 +2117,10 @@ PyDefUtils.repaginateChildren = (self, skip, startAfter, remainingRowQuota) => {
     
 };
 
-class WrappedPyObj {
-    constructor(obj) {
-        this.v = obj;
-        this.$isPyWrapped = true;
-        this.unwrap = () => obj;
-    }
-}
-
-function WrappedPyCallable(obj) {
-    const wrapped =(...args) => {
-        let ret = Sk.misceval.chain(obj.tp$call(args.map((x) => Sk.ffi.toPy(x))), (res) => PyDefUtils.remapToJsOrWrap(res));
-        while (ret instanceof Sk.misceval.Suspension) {
-            // ignore all optinal suspensions for a python wrapped callable sent to javascript
-            if (!ret.optional) {
-                return Sk.misceval.asyncToPromise(() => ret);
-            }
-            ret = ret.resume();
-        }
-        return ret;
-    };
-    wrapped.v = obj;
-    wrapped.unwrap = () => obj;
-    wrapped.$isPyWrapped = true;
-    return wrapped;
-}
-
-PyDefUtils.remapToJsOrWrap = function remapToJsOrWrap(pyObj) {
-    return Sk.ffi.toJs(pyObj, { unhandledHook: (obj) => (obj.tp$call ? WrappedPyCallable(obj) : new WrappedPyObj(obj)) });
-}
-PyDefUtils.unwrapOrRemapToPy = Sk.ffi.toPy; // keep this around even though it is just an alias
+/** @deprecated */
+PyDefUtils.remapToJsOrWrap = remapToJsOrWrap;
+/** @deprecated */
+PyDefUtils.unwrapOrRemapToPy = toPy; // keep this around even though it is just an alias
 
 PyDefUtils.callJs = (pyComponent, pyFnName, ...pyArgs) => {
 
@@ -2057,11 +2153,23 @@ PyDefUtils.callJs = (pyComponent, pyFnName, ...pyArgs) => {
 
     let rv = fn.apply(jqueryWrapped, pyArgs.map(PyDefUtils.remapToJsOrWrap));
     if (rv instanceof Promise) {
-        rv = PyDefUtils.suspensionFromPromise(rv.then(Sk.ffi.toPy));
+        rv = PyDefUtils.suspensionFromPromise(rv.then(toPy));
     } else {
-        rv = Sk.ffi.toPy(rv);
+        rv = toPy(rv);
     }
     return rv;
+};
+
+/**
+ * @param {Promise} p
+ * @returns {Promise}
+ */
+PyDefUtils.withDelayPrint = (p) => {
+    if (!window.outstandingPrintDelayPromises) return p;
+    const key = Math.random().toString(36).substring(6);
+    const d = defer();
+    window.outstandingPrintDelayPromises[key] = d;
+    return p.then(d.resolve);
 };
 
 PyDefUtils.delayPrint = key => {

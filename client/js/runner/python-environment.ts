@@ -1,56 +1,34 @@
 //import * as $ from "jquery";
-import {provideLoggingImpl, stdout} from "./logging";
-import {AppYaml, data, DependencyYaml} from "./data";
-import {uncaughtExceptions} from "./error-handling";
-import * as componentModule from "../components";
-import * as PyDefUtils from "../PyDefUtils";
-import {createFormTemplateClass} from "./forms";
-import {PyModMap} from "./py-util";
-import {pyCall, pyList, pyObject, pyStr} from "../@Sk";
-import {Component} from "../components/Component";
-import {runPostSetupHooks} from "./components-in-js/common";
-import {pyDesignerApi} from "./component-designer-api";
+import { chainOrSuspend, Suspension, suspensionToPromise } from "@Sk";
 import { Container } from "@runtime/components/Container";
-import {pyPropertyUtilsApi} from "@runtime/runner/component-property-utils-api";
+import { setupDefaultAnvilPluggableUI } from "@runtime/modules/_anvil/pluggable-ui";
+import { pyPropertyUtilsApi } from "@runtime/runner/component-property-utils-api";
+import { hooks } from "@runtime/runner/index";
+import * as PyDefUtils from "../PyDefUtils";
+import * as componentModule from "../components";
+import { Component } from "../components/Component";
+import { pyDesignerApi } from "./component-designer-api";
+import { registerJsPythonModules } from "./components-in-js/common";
+import { AppYaml, data, DependencyYaml } from "./data";
+import { uncaughtExceptions } from "./error-handling";
+import { createFormTemplateClass } from "./forms";
+import { setupLegacyV1AnvilModule } from "./legacy-python-environment";
+import { provideLoggingImpl, stdout } from "./logging";
+import { PyModMap } from "./py-util";
+import { Slot, WithLayout } from "./python-objects";
+import { readBuiltinFiles } from "./read-builtin-files";
+import { warn } from "./warnings";
 
-export const skulptFiles: {[filename:string]: string} = {};
+export const skulptFiles: { [filename: string]: string } = {};
 
+let registerServerCallSuspension: null | ((s: Suspension<{ serverRequestId: string }>) => void) = null;
 
 function builtinRead(path: string) {
     if (path in skulptFiles) {
         return skulptFiles[path];
     }
-
-    const file = Sk.builtinFiles?.files[path];
-    if (file === undefined) {
-        throw "File not found: '" + path + "'";
-    } else if (typeof file === "number") {
-        // slow path we need to do a fetch
-        return Sk.misceval.promiseToSuspension(
-            new Promise((resolve, reject) => {
-                // while we support IE don't use fetch since fetch is not polyfilled by core-js
-                const xhr = new XMLHttpRequest();
-                // this variable is created in runner.html - we create it there so that a sha can be added
-                // when this file includes a sha value it can be aggressively cached by the browser
-                
-                // this is undefined when this module first loads since the runner is loaded before we set window.anvilSkulptLib
-                
-                const fetchUrl = window.anvilSkulptLib[file];
-                xhr.open("GET", fetchUrl, true);
-                xhr.onload = function () {
-                    const newFiles = JSON.parse(this.responseText);
-                    Object.assign(Sk.builtinFiles.files, newFiles);
-                    resolve(newFiles[path]);
-                };
-                xhr.onerror = reject;
-                xhr.send();
-            })
-        );
-    } else {
-        return file;
-    }
+    return readBuiltinFiles(path);
 }
-
 
 function loadOrdinaryModulesReturningAnvilModule() {
     const anvilModule = require("../modules/anvil")(data.appOrigin, uncaughtExceptions);
@@ -79,6 +57,7 @@ function loadOrdinaryModulesReturningAnvilModule() {
 
     const serverModuleAndLog = require("../modules/server")(data.appId, data.appOrigin);
     provideLoggingImpl(serverModuleAndLog.log);
+    registerServerCallSuspension = serverModuleAndLog.registerServerCallSuspension;
     PyDefUtils.loadModule("anvil.server", serverModuleAndLog.pyMod);
 
     const httpModule = require("../modules/http")();
@@ -86,6 +65,10 @@ function loadOrdinaryModulesReturningAnvilModule() {
 
     const jsModule = require("../modules/js")();
     PyDefUtils.loadModule("anvil.js", jsModule);
+
+    // server needs to have loaded first
+    const historyModule = require("../modules/history").default;
+    PyDefUtils.loadModule("anvil.history", historyModule);
 
     const imageModule = require("../modules/image")();
     PyDefUtils.loadModule("anvil.image", imageModule);
@@ -99,17 +82,23 @@ function loadOrdinaryModulesReturningAnvilModule() {
 
     PyDefUtils.loadModule("anvil.property_utils", pyPropertyUtilsApi);
 
-    // TODO there are more elegant ways to do this! (I think we just need to include "anvil.tables" in the preloadModules)
-    try {
-        Sk.misceval.retryOptionalSuspensionOrThrow(Sk.importModule("anvil.tables", false, true));
-    } catch (e) {
-        console.log("Failed to preload anvil.tables", e);
-    }
+    anvilModule["Slot"] = Slot;
+    anvilModule["WithLayout"] = WithLayout;
+
+    setupDefaultAnvilPluggableUI(anvilModule);
 
     return anvilModule;
 }
 
 function setupAppSourceCode() {
+    const createModule = (pkgName: string) => {
+        PyDefUtils.loadModule(pkgName, {
+            __name__: new Sk.builtin.str(pkgName),
+            __path__: new Sk.builtin.tuple([new Sk.builtin.str("app/" + pkgName)]),
+            __package__: new Sk.builtin.str(pkgName),
+        });
+    };
+
     const getFilePath = (name: string, isPackage: boolean | undefined, topLevelPackage: string) =>
         "app/" + topLevelPackage + "/" + name.replace(/\./g, "/") + (isPackage ? "/__init__.py" : ".py");
 
@@ -127,14 +116,32 @@ function setupAppSourceCode() {
     const dependencyPackageNames = [];
     const dataBindingCompilations = {};
 
+    createModule(data.appPackage);
+
     for (const [depAppId, depApp] of Object.entries(data.app.dependency_code)) {
-        if (!depApp.package_name) { continue; }
+        if (!depApp.package_name) {
+            continue;
+        }
+
+        createModule(depApp.package_name);
 
         if (dependencyPackageNames.indexOf(depApp.package_name) == -1) {
             fillOutModules(depApp, depApp.package_name);
             dependencyPackageNames.push(depApp.package_name);
         } else {
-            dependencyErrors.push(`Cannot have two dependencies with the same package name: ${depApp.package_name}`);
+            const conflictingAppIds = Object.entries(data.app.dependency_code)
+                .filter(([id, { package_name }]) => package_name === depApp.package_name)
+                .map(([id, app]) => id);
+            const errorMsg = `This app has ${
+                conflictingAppIds.length
+            } conflicting dependencies with the package name "${depApp.package_name}" (${conflictingAppIds.join(
+                ", "
+            )}).`;
+            if ((data.app.runtime_options?.version ?? 0) < 3 && !data.app.runtime_options?.preview_v3) {
+                warn("Warning: " + errorMsg + "This may cause errors in your app, and will be an error in future.\n");
+            } else {
+                dependencyErrors.push(errorMsg);
+            }
         }
     }
 
@@ -148,37 +155,6 @@ function setupAppSourceCode() {
     }
 }
 
-function makePerAppAnvilModule(globalAnvilModule: PyModMap, packageName: string) {
-
-    const anvilModule = $.extend({}, globalAnvilModule);
-
-    // By default templates with _ prefixes won't get imported by "from anvil import *", so we set __all__
-    anvilModule["__all__"] = new pyList(
-        Object.keys(anvilModule)
-            .filter((s) => !s.startsWith("_"))
-            .map((s) => new pyStr(s))
-    );
-
-    PyDefUtils.loadModule(packageName + ".anvil", anvilModule);
-    const sysModulesCopy = pyCall(Sk.sysmodules.tp$getattr(new pyStr("copy"))) as typeof Sk.sysmodules;
-    const jsModNames = Sk.abstr.iter(sysModulesCopy);
-    for (let modName = jsModNames.tp$iternext(); modName !== undefined; modName = jsModNames.tp$iternext()) {
-        if (modName.toString().startsWith("anvil.")) {
-            const pyMod = Sk.sysmodules.mp$subscript(modName);
-            if (pyMod.$d) {
-                PyDefUtils.loadModule(packageName + "." + modName, pyMod.$d);
-            } else {
-                // anvil.js.window is in sysmodules but is not a module object
-                // so just set it in sysmodules with adjusted path
-                Sk.abstr.objectSetItem(Sk.sysmodules, new Sk.builtin.str(packageName + "." + modName), pyMod);
-            }
-            //console.log("Copying", modName.$jsstr(), "for", packageName);
-        }
-    }
-
-    return anvilModule;
-}
-
 window.anvilFormTemplates = [];
 
 function setupAppTemplates(
@@ -187,18 +163,7 @@ function setupAppTemplates(
     appPackage: string,
     anvilModule: PyModMap
 ) {
-    PyDefUtils.loadModule(appPackage, {
-        __name__: new Sk.builtin.str(appPackage),
-        __path__: new Sk.builtin.tuple([new Sk.builtin.str("app/" + appPackage)]),
-        __package__: new Sk.builtin.str(appPackage),
-    });
-
-    // Runtime v1 and below uses a really grotty mechanism for getting form templates.
-    // We use prototypical inheritance to give each app a slightly different
-    // view of the 'anvil' module, with its own form templates in.
-
-    const perAppAnvilModule =
-        (yaml.runtime_options?.version || 0) < 2 && makePerAppAnvilModule(anvilModule, appPackage);
+    const templates = {} as PyModMap;
 
     for (const form of yaml.forms || []) {
         // In newer (v2+) apps, we build an "_anvil_designer" module in each package with the form
@@ -227,21 +192,31 @@ function setupAppTemplates(
 
         const pyTemplateClass = createFormTemplateClass(form, depAppId, className, anvilModule);
         aft[aft.length] = pyTemplateClass;
-        if (perAppAnvilModule) {
-            perAppAnvilModule[`${className}Template`] = pyTemplateClass;
-            perAppAnvilModule["__all__"].v.push(new pyStr(`${className}Template`));
-        }
+        templates[`${className}Template`] = pyTemplateClass;
+    }
+    if ((yaml.runtime_options?.version || 0) < 2) {
+        setupLegacyV1AnvilModule(anvilModule, appPackage, templates);
     }
 }
 
+const isServerRequestSuspension = (s: Suspension): s is Suspension<{ serverRequestId: string }> =>
+    s.data !== null && typeof s.data === "object" && "serverRequestId" in s.data;
 
-export function setupPythonEnvironment(preloadModules: string[]) {
+PyDefUtils.suspensionHandlers["Sk.promise"] = (s: Suspension) => {
+    if (isServerRequestSuspension(s)) {
+        registerServerCallSuspension?.(s);
+    }
+    // Now fall through to the default Sk.promise suspension handler
+};
 
+export async function setupPythonEnvironment() {
+    const extraOptions = hooks.getSkulptOptions?.() || {};
     Sk.configure({
         output: stdout,
         read: builtinRead,
         syspath: ["app", "anvil-services"],
-        __future__: (data.app.runtime_options?.client_version == "3") ? Sk.python3 : Sk.python2,
+        __future__: data.app.runtime_options?.client_version == "3" ? Sk.python3 : Sk.python2,
+        ...extraOptions,
     });
     Sk.importSetUpPath(); // This is hack - normally happens automatically on first import
 
@@ -254,23 +229,32 @@ export function setupPythonEnvironment(preloadModules: string[]) {
     // Inject the theme HTML assets into the HtmlTemplate component
     anvilModule["HtmlTemplate"].$_anvilThemeAssets = data.app.theme?.html || {};
 
-    for (const pm of (preloadModules || [])) {
-        Sk.misceval.retryOptionalSuspensionOrThrow(Sk.importModule(pm, false, true));
-    }
-
-
     setupAppSourceCode();
 
-    runPostSetupHooks();
+    registerJsPythonModules();
 
-    for (const [depAppId, depApp] of Object.entries(data.app.dependency_code)) {
+    const clientInitModules: string[] = [];
 
-        if (!depApp.package_name)
-            continue;
-
+    for (const depAppId of data.app.dependency_order) {
+        const depApp = data.app.dependency_code[depAppId];
+        if (!depApp.package_name) continue;
         setupAppTemplates(depApp, depAppId, depApp.package_name, anvilModule);
+
+        if (depApp.client_init_module) {
+            clientInitModules.push(`${depApp.package_name}.${depApp.client_init_module}`);
+        }
     }
 
     setupAppTemplates(data.app, null, data.appPackage, anvilModule);
 
+    if (data.app.client_init_module) {
+        clientInitModules.push(`${data.appPackage}.${data.app.client_init_module}`);
+    }
+
+    if (clientInitModules.length > 0) {
+        // do this after setupAppTemplates so that _anvil_designer modules are available
+        await suspensionToPromise(() =>
+            chainOrSuspend(null, ...clientInitModules.map((m) => () => Sk.importModule(m, false, true)))
+        );
+    }
 }

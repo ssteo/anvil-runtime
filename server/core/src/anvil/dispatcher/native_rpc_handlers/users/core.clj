@@ -39,7 +39,9 @@
             [anvil.dispatcher.native-rpc-handlers.users.totp :as totp]
             [anvil.dispatcher.native-rpc-handlers.users.twilio :as twilio]
             [anvil.runtime.sessions :as sessions]
-            [anvil.runtime.conf :as runtime-conf])
+            [anvil.runtime.conf :as runtime-conf]
+            [anvil.core.worker-pool :as worker-pool]
+            [anvil.runtime.conf :as conf])
   (:import (anvil.dispatcher.types DateTime)
            (java.text SimpleDateFormat)
            (java.util Date)
@@ -74,7 +76,9 @@
   (set-values-creating-col-if-necessary table-id row-id {col_name val})
   val)
 
-(defn logout [_kwargs]
+(defn logout [{:keys [invalidate_client_objects] :as kwargs}]
+  (when invalidate_client_objects
+    (util/invalidate-client-objects!))
   (let [{:keys [user_table] :as props} (get-props-with-named-user-table)
         cookie-type (get-cookie-type props)
         cookie-key-token (keyword (str "user-table-" user_table "-remember-me"))]
@@ -370,19 +374,19 @@
 
 (def default-emails
   {:token_login     {:subject_suffix "Login"
-                     :html           "<p>Hi there,\n\n<p>A login request was received for your account ({{email}}). To log in, click the link below:\n\n<p>{{login_link}}\n\n<p>This link will expire in ten minutes."}
+                     :html           "<p>Hi there,</p>\n\n<p>A login request was received for your account ({{email}}). To log in, click the link below:</p>\n\n<p>{{login_link}}</p>\n\n<p>This link will expire in ten minutes.</p>"}
 
    :mfa_reset       {:subject_suffix "Authentication Reset"
-                     :html           "<p>Hi there,\n\n<p>A two-factor authentication reset request was received for your account {{email}}. To continue, click the link below.\n\n<p>{{login_link}}\n\n<p>This link will expire in ten minutes."}
+                     :html           "<p>Hi there,</p>\n\n<p>A two-factor authentication reset request was received for your account {{email}}. To continue, click the link below.</p>\n\n<p>{{login_link}}</p>\n\n<p>This link will expire in ten minutes.</p>"}
 
    :confirm_address {:subject "Confirm your email address"
-                     :html    (str "<p>Thanks for registering your account with us. Please click the following link to confirm that this is your account:\n\n"
-                                   "<p>{{confirm_link}}\n\n"
-                                   "<p>Thanks,\n"
-                                   "<p>The team")}
+                     :html    (str "<p>Thanks for registering your account with us. Please click the following link to confirm that this is your account:</p>\n\n"
+                                   "<p>{{confirm_link}}</p>\n\n"
+                                   "<p>Thanks,</p>\n"
+                                   "<p>The team</p>")}
 
    :reset_password  {:subject "Reset your password"
-                     :html    (str "<p>Hi there,\n\n<p>You have requested a password reset for your account {{email}}. To reset your password, click the link below:\n\n<p>{{reset_link}}\n\n<p>This link will expire in ten minutes.")}})
+                     :html    (str "<p>Hi there,</p>\n\n<p>You have requested a password reset for your account {{email}}. To reset your password, click the link below:</p>\n\n<p>{{reset_link}}</p>\n\n<p>This link will expire in ten minutes.</p>")}})
 
 (defn send-email! [service-props to email-name text-subs link-subs]
   (let [{:keys [email_content email_from_address]} service-props
@@ -391,7 +395,7 @@
                         email_content)
         from-name (if (app-data/abuse-caution? util/*session-state* util/*app-id*)
                     "Accounts"
-                    (str (:name util/*app*) " Accounts"))
+                    (str (or (:name util/*app-info*) (:name util/*app*)) " Accounts"))
         from-address (or email_from_address "accounts")
         subject (or (get-in email_content [email-name :subject])
                     (get-in default-emails [email-name :subject])
@@ -440,7 +444,7 @@
         (let [login-link (str (get-our-origin)
                               "/_/login/"
                               (anvil-util/real-actual-genuine-url-encoder (generate-email-link-token nil email "login")))]
-          (send-email! props email :token_login {:email email} {:login_link login-link})
+          (send-email! props email :token_login {:email email :login_url login-link} {:login_link login-link})
           nil)
         (throw+ {:anvil/server-error "User disabled, or not found." :type "anvil.users.AuthenticationFailed"})))))
 
@@ -459,7 +463,7 @@
           ;; Only send the email if reset is allowed, or if mfa is required and we have no methods available.
           (if (or allow_mfa_email_reset
                   (and require_mfa (not mfa-available-for-user?)))
-            (do (send-email! props email :mfa_reset {:email email} {:login_link login-link})
+            (do (send-email! props email :mfa_reset {:email email :login_url login-link} {:login_link login-link})
                 nil)
             (throw+ {:anvil/server-error "Cannot reset two-factor authentication by email." :type "anvil.users.AuthenticationFailed"})))
         (throw+ {:anvil/server-error "User disabled, or not found." :type "anvil.users.AuthenticationFailed"})))))
@@ -495,7 +499,7 @@
                             (codec/url-encode email)
                             (codec/url-encode confirmation-key))]
     (when confirm_email
-      (send-email! props email :confirm_address {:email email} {:confirm_link confirm-url}))
+      (send-email! props email :confirm_address {:email email :confirm_url confirm-url} {:confirm_link confirm-url}))
     new-user-row))
 
 (defn send-password-reset-email [_kwargs email]
@@ -511,11 +515,16 @@
       (if (get-user-check-enabled-and-validate user_table {:email email} :email)
         (let [reset-link (str (get-our-origin)
                               "/_/reset_password/"
-                              (anvil-util/real-actual-genuine-url-encoder (generate-email-link-token nil email "pw-reset")))]
+                              (anvil-util/real-actual-genuine-url-encoder (generate-email-link-token nil email "pw-reset")))
+              request util/*req*]
 
-          (send-email! props email :reset_password {:email email} {:reset_link reset-link})
-          nil)
-        (throw+ {:anvil/server-error "User disabled, or not found." :type "anvil.users.AuthenticationFailed"})))))
+          (worker-pool/run-task! ::send-reset-email
+            (util/with-basic-native-bindings-from-request request
+              (send-email! props email :reset_password {:email email :reset_url reset-link} {:reset_link reset-link})))
+          (when-not conf/dont-confirm-emails-during-auth?
+            true))
+        (when-not conf/dont-confirm-emails-during-auth?
+          (throw+ {:anvil/server-error "This username does not exist or is disabled." :type "anvil.users.AuthenticationFailed"}))))))
 
 (defn call-if-confirmation-key-correct [app environment email confirmation-key require-settings f]
   (binding [util/*client-request?* false

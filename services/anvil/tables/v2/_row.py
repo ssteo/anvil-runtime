@@ -9,7 +9,7 @@ from ._utils import check_serialized, clean_local_datetime, init_spec_rows, init
 
 PREFIX = SERVER_PREFIX + "row."
 _make_refs = None  # for circular imports
-_auto_create_is_enabled = None
+_auto_create_is_enabled = NOT_FOUND
 
 
 def _copy(so):
@@ -84,7 +84,7 @@ class Row(BaseRow):
         table_data, local_data = info.shared_data(SHARED_DATA_KEY)
         view_key, table_id, row_id, cap = data
         if not info.remote_is_trusted:
-            validate_cap(cap, view_key, table_id, row_id)
+            validate_cap(cap, table_id, row_id)
             table_data = None  # just incase
         if not table_data:
             # table_data None is not enough because we may be sending rows back and forward
@@ -147,7 +147,22 @@ class Row(BaseRow):
         if table_id is None or val is UNCACHED or val is None:
             # not a linked row, or UNCACHED linked row (serialize cache dispute), or linked row is None
             return val
-        col_type, view_key = col["type"], col["view_key"]
+
+        # This line is failing for baker tilly - wrap in a try except
+        try:
+            col_type, view_key = col["type"], col["view_key"]
+        except KeyError:
+            import json
+
+            msg = 'Failed to get "view_key" or "type" from col {}'.format(col)
+            try:
+                _data = json.dumps(table_data, indent=2, default=lambda o: str(type(o)))
+                msg += "\n\nTable data:\n{}".format(_data)
+            except Exception:
+                pass
+
+            raise KeyError(msg)
+
         if col_type == SINGLE:
             row_id = val
             return Row._create_from_trusted(view_key, table_id, row_id, table_data)
@@ -325,7 +340,7 @@ class Row(BaseRow):
             raise TypeError("Row columns are always strings, not {}".format(type(key).__name__))
         if _batcher.batch_update.active:
             rv = _batcher.batch_update.read(self._cap, key)
-            if key is not NOT_FOUND:
+            if rv is not NOT_FOUND:
                 return _copy(rv)
         if self._spec is None:
             self._fill_cache()
@@ -335,7 +350,7 @@ class Row(BaseRow):
             self._fill_cache()
         elif hit is NOT_FOUND:
             global _auto_create_is_enabled
-            if _auto_create_is_enabled is None:
+            if _auto_create_is_enabled is NOT_FOUND:
                 _auto_create_is_enabled = anvil.server.call(PREFIX + "can_auto_create")
             if _auto_create_is_enabled:
                 # try to force fetch this key - incase we have a bad spec - i.e auto-columns

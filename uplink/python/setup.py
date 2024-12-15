@@ -24,7 +24,7 @@ setup(
     # the version across setup.py and the project code, see
     # https://packaging.python.org/en/latest/single_source_version.html
 
-    version='0.4.2',
+    version='0.5.2',
 
     description='The Anvil server uplink library',
     long_description=long_description,
@@ -68,6 +68,8 @@ setup(
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
     ],
 
     # What does your project relate to?
@@ -85,7 +87,7 @@ setup(
     # your project is installed. For an analysis of "install_requires" vs pip's
     # requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=['argparse', 'future', 'six', 'ws4py'],
+    install_requires=['argparse', 'future', 'six', 'ws4py-sslupdate'],
 
     # List additional groups of dependencies here (e.g. development
     # dependencies). You can install these using the following syntax,

@@ -2,6 +2,7 @@
 
 import { getCssPrefix } from "@runtime/runner/legacy-features";
 import { setHandled } from "./events";
+import { getUnsetSpacing, setElementMargin, setElementPadding } from "@runtime/runner/components-in-js/public-api/property-utils";
 var PyDefUtils = require("PyDefUtils");
 
 /*#
@@ -31,7 +32,7 @@ module.exports = (pyModule) => {
 
     pyModule["Button"] = PyDefUtils.mkComponentCls(pyModule, "Button", {
         properties: PyDefUtils.assembleGroupProperties(
-            /*!componentProps(Button)!2*/ ["layout", "interaction", "text", "appearance", "icon", "user data", "tooltip"],
+            /*!componentProps(Button)!2*/ ["layout", "layout_spacing", "interaction", "text", "appearance", "icon", "user data", "tooltip"],
             {
                 align: {
                     defaultValue: new Sk.builtin.str("center"),
@@ -54,6 +55,7 @@ module.exports = (pyModule) => {
                     multiline: true,
                     suggested: true,
                     inlineEditElement: 'text',
+                    group: undefined,
                 },
                 font_size: {
                     set(s, e, v) {
@@ -95,6 +97,15 @@ module.exports = (pyModule) => {
                         s._anvil.elements.button.style.color = PyDefUtils.getColor(v);
                     },
                 },
+                spacing: {
+                    set(s, e, v) {
+                        setElementMargin(e[0], v?.margin);
+                        setElementPadding(s._anvil.elements.button, v?.padding);
+                    },
+                    getUnset(s, e, currentValue) {
+                        return getUnsetSpacing(e[0], s._anvil.elements.button, currentValue);
+                    }
+                },
             }
         ),
 
@@ -110,6 +121,7 @@ module.exports = (pyModule) => {
                             "A dictionary of keys including 'shift', 'alt', 'ctrl', 'meta'. " +
                             "Each key's value is a boolean indicating if it was pressed during the click event. " +
                             "The meta key on a mac is the Command key",
+                        important: false,
                     },
                 ],
                 important: true,
@@ -117,20 +129,22 @@ module.exports = (pyModule) => {
             },
         }),
 
-        element({ font, font_size, bold, italic, underline, background, foreground, ...props }) {
+        element({ font, font_size, bold, italic, underline, background, foreground, spacing,...props }) {
             const align = props.align.toString();
             const alignStyle = align === "full" ? " width: 100%;" : "";
+            const outerSpacingStyle = PyDefUtils.getOuterStyle({spacing}, false);
+            const buttonPaddingStyle = PyDefUtils.getPaddingStyle({spacing});
             const buttonStyle = PyDefUtils.getOuterStyle({ font, font_size, bold, italic, underline, background, foreground });
             const buttonAttrs = !isTrue(props.enabled) ? {disabled: ""} : {};
-            const inlinable = align !== "full" ? "anvil-inlinable " : ""
+            const inlinable = align !== "full" ? "anvil-inlinable " : "";
             const prefix = getCssPrefix();
             return (
-                <PyDefUtils.OuterElement className= {inlinable + "anvil-button"} {...props}>
+                <PyDefUtils.OuterElement className= {inlinable + "anvil-button"} style={outerSpacingStyle} {...props}>
                     <button
                         refName="button"
                         ontouchstart=""
                         className={`${prefix}btn ${prefix}btn-default ${prefix}to-disable`}
-                        style={"max-width:100%; text-overflow:ellipsis; overflow:hidden; " + buttonStyle + alignStyle}
+                        style={"max-width:100%; text-overflow:ellipsis; overflow:hidden; " + buttonStyle + alignStyle + buttonPaddingStyle}
                         {...buttonAttrs}>
                         <PyDefUtils.IconComponent side="left" {...props} />
                         <span refName="text" className={`${prefix}button-text`}>
@@ -144,20 +158,17 @@ module.exports = (pyModule) => {
 
         locals($loc) {
             $loc["__new__"] = PyDefUtils.mkNew(pyModule["ClassicComponent"], (self) => {
-                $(self._anvil.elements.button).on(
-                    "click",
-                    PyDefUtils.funcWithPopupOK((e) => {
-                        setHandled(e);
-                        // Search me why this is needed, but it is.
-                        if (!isTrue(self._anvil.props["enabled"])) return;
+                $(self._anvil.elements.button).on("click", (e) => {
+                    setHandled(e);
+                    // Search me why this is needed, but it is.
+                    if (!isTrue(self._anvil.props["enabled"])) return;
 
-                        PyDefUtils.raiseEventAsync(
-                            { keys: { meta: e.metaKey, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } },
-                            self,
-                            "click"
-                        );
-                    })
-                );
+                    PyDefUtils.raiseEventAsync(
+                        { keys: { meta: e.metaKey, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } },
+                        self,
+                        "click"
+                    );
+                });
             });
         },
     });

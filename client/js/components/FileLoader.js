@@ -2,6 +2,7 @@
 
 const { getCssPrefix } = require("@runtime/runner/legacy-features");
 var PyDefUtils = require("PyDefUtils");
+const { setElementMargin, setElementPadding, getUnsetSpacing } = require("@runtime/runner/components-in-js/public-api/property-utils");
 
 /*#
 id: fileloader
@@ -49,16 +50,19 @@ module.exports = (pyModule) => {
     const { isTrue } = Sk.misceval;
 
     pyModule["FileLoader"] = PyDefUtils.mkComponentCls(pyModule, "FileLoader", {
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(FileLoader)!1*/ ["layout", "text", "appearance", "icon", "interaction", "user data", "tooltip"], {
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(FileLoader)!1*/ ["layout", "layout_spacing", "text", "appearance", "icon", "interaction", "user data", "tooltip"], {
             text: {
                 dataBindingProp: true,
                 defaultValue: new Sk.builtin.str("Upload"),
+                group: undefined,
+                inlineEditElement: "text",
             },
             align: {
                 defaultValue: new Sk.builtin.str("center"),
             },
             icon: {
                 defaultValue: new Sk.builtin.str("fa:upload"),
+                group: undefined,
             },
             bold: {
                 set(s, e, v) {
@@ -159,6 +163,15 @@ module.exports = (pyModule) => {
                     s._anvil.elements.input.accept = isTrue(v) ? Sk.ffi.remapToJs(v) : "";
                 },
             },
+            spacing: {
+                set(s, e, v) {
+                    setElementMargin(e[0], v?.margin);
+                    setElementPadding(s._anvil.elements.label, v?.padding);
+                },
+                getUnset(s, e, currentValue) {
+                    return getUnsetSpacing(e[0], s._anvil.elements.label, currentValue);
+                }
+            },
         }),
 
         events: PyDefUtils.assembleGroupEvents("FileLoader", /*!componentEvents(FileLoader)!1*/ ["universal", "focus"], {
@@ -188,10 +201,11 @@ module.exports = (pyModule) => {
 
         element({ bold, font_size, border, background, foreground, multiple, enabled, file_types, underline, ...props }) {
             const prefix = getCssPrefix();
-            const outerStyle = PyDefUtils.getOuterStyle(props);
+            const outerStyle = PyDefUtils.getOuterStyle(props, false);
             const outerClass = PyDefUtils.getOuterClass(props) + (isTrue(enabled) ? "" : " anvil-disabled");
             const outerAttrs = PyDefUtils.getOuterAttrs(props);
             const labelStyle = PyDefUtils.getOuterStyle({ bold, font_size, border, background, foreground, underline });
+            const labelPaddingStyle = PyDefUtils.getPaddingStyle({spacing: props.spacing});
             const { icon, icon_align } = props;
             const inputAttrs = {};
             if (isTrue(multiple)) {
@@ -203,7 +217,7 @@ module.exports = (pyModule) => {
             file_types = isTrue(file_types) ? file_types.toString() : ""
             return (
                 <a refName="outer" className={`${prefix}file-loader ${outerClass}`} href="javascript:void(0)" style={outerStyle} {...outerAttrs}>
-                    <label refName="label" className="anvil-inlinable" style={labelStyle}>
+                    <label refName="label" className="anvil-inlinable" style={labelStyle + labelPaddingStyle}>
                         <PyDefUtils.IconComponent side="left" icon={icon} icon_align={icon_align} />
                         <span refName="text" className={`${prefix}label-text`}>
                             {Sk.builtin.checkNone(props.text) ? "" : props.text.toString()}
@@ -239,7 +253,23 @@ module.exports = (pyModule) => {
                     // todo this doesn't work
                     .on("focus", (e) => PyDefUtils.raiseEventAsync({}, self, "focus"))
                     .on("blur", (e) => PyDefUtils.raiseEventAsync({}, self, "lost_focus"));
+
+                if (ANVIL_IN_DESIGNER) {
+                    Object.defineProperty(self._anvil, "inlineEditing", {
+                        set(v) {
+                            // see CheckBox.js
+                            self._anvil.elements.input.type = v ? "hidden" : "checkbox";
+                        }
+                    });
+                }
             });
+
+            /*!defMethod(_)!2*/ "Open the file selector from code, this should be called within a click event handler for another component";
+            $loc["open_file_selector"] = new Sk.builtin.func((self) => {
+                self._anvil.elements.input.click();
+                return Sk.builtin.none.none$;
+            });
+
 
             /*!defMethod(_)!2*/ "Set the keyboard focus to this FileLoader"
             $loc["focus"] = new Sk.builtin.func(function focus(self) {

@@ -1,21 +1,29 @@
 "use strict";
 
+import { setOnDebuggerMessage } from "@runtime/modules/_server/handlers";
+import { registerServerCallSuspension } from "@runtime/modules/_server/rpc";
+import { data } from "@runtime/runner/data";
+import { anvilMod, s__get__, s__module__, s__name__ } from "@runtime/runner/py-util";
 import {
     Args,
     buildNativeClass,
     buildPyClass,
     chainOrSuspend,
     checkCallable,
-    checkString, isTrue,
+    checkString,
+    isTrue,
     Kws,
     objectRepr,
-    promiseToSuspension, pyBool,
+    promiseToSuspension,
+    pyAttributeError,
+    pyBool,
     pyCall,
     pyCallable,
     pyCallOrSuspend,
     pyCheckType,
     pyException,
     pyFunc,
+    pyIterFor,
     pyList,
     pyLookupError,
     pyNewableType,
@@ -25,7 +33,7 @@ import {
     pyObject,
     pyObjectHash,
     pyRuntimeError,
-    pyStr, pyTrue,
+    pyStr,
     pyType,
     pyTypeError,
     pyValueError,
@@ -37,7 +45,8 @@ import {
 } from "@Sk";
 import PyDefUtils from "PyDefUtils";
 import { anvilAppOnline } from "../app_online";
-import { anvilMod, globalSuppressLoading } from "../utils";
+import { globalSuppressLoading } from "../utils";
+import { loading_indicator } from "./_anvil/loading-indicator";
 import {
     connect,
     doHttpCall,
@@ -51,10 +60,12 @@ import {
 } from "./_server";
 import type { Capability } from "./_server/types";
 
+//@ts-ignore
 module.exports = function (appId: string, appOrigin: string) {
     const pyMod: { [attr: string]: pyObject } = {
         __name__: new pyStr("anvil.server"),
         app_origin: toPy(appOrigin),
+        loading_indicator,
     };
 
     const checkCommand = (cmd: any): cmd is pyStr => {
@@ -101,6 +112,8 @@ module.exports = function (appId: string, appOrigin: string) {
     // This class is deprecated - no need to subclass it any more.
     pyMod["Serializable"] = buildPyClass(pyMod, () => {}, "Serializable", [pyObject]);
 
+    pyMod["_n_invalidations"] = toPy(0);
+
     const _CapAny = buildNativeClass("_CapAny", {
         constructor: function () {},
         slots: {
@@ -113,6 +126,7 @@ module.exports = function (appId: string, appOrigin: string) {
 
     const pyCapability: pyNewableType<Capability> = (pyMod["Capability"] = buildNativeClass("anvil.server.Capability", {
         constructor: function Capability(scope, mac, narrow) {
+            this._nInvalidations = pyMod["_n_invalidations"].valueOf();
             this._scope = scope;
             this._mac = mac;
             this._narrow = narrow || (narrow = []);
@@ -207,6 +221,11 @@ module.exports = function (appId: string, appOrigin: string) {
                     return this._pyFullScope;
                 },
             },
+            is_valid: {
+                $get() {
+                    return new pyBool(this._nInvalidations === pyMod["_n_invalidations"].valueOf());
+                },
+            },
         },
         proto: {
             ANY: _ANY,
@@ -222,8 +241,12 @@ module.exports = function (appId: string, appOrigin: string) {
             description:
                 "A list representing what this capability represents. It can be extended by calling narrow(), but not shortened.\n\nEg: ['my_resource', 42, 'foo']",
         },
-    ];
-    [
+        /*!defAttr()!1*/ {
+            name: "is_valid",
+            type: "boolean",
+            description:
+                "True if this Capability is still valid; False if it has been invalidated (for example, by session expiry)",
+        },
         /*!defClassAttr()!1*/ {
             name: "ANY",
             type: "object",
@@ -440,6 +463,19 @@ module.exports = function (appId: string, appOrigin: string) {
         [pyException]
     );
 
+    /*!defFunction(anvil.server, context, component_name=None, min_height=None)!2*/
+    ({
+        anvil$helplink: "/docs/client",
+        $doc: "By default, a loading indicator is displayed when your app is retrieving data. This stops users from being able to interact with your app while the server returns data. `loading_indicator` is a context manager which allows you to create loading indicators manually.",
+        anvil$args: {
+            component_name:
+                "Optionally give the component or container that the loading indicator should overlay. This will block any user interaction with the given component, and any child components they have.",
+            min_height:
+                "Optionally set the minimum height of the loading indicator. If no minimum height is given and no `component_name` is given, it defaults to the size of the image or SVG being used. If no minimum height is given but a `component_name` _is_ given, then the indicator scales to fit the component or container.",
+        },
+    });
+    ["loading_indicator"];
+
     const _NoLoadingIndicator = buildPyClass(
         pyMod,
         function ($gbl, $loc) {
@@ -464,20 +500,38 @@ module.exports = function (appId: string, appOrigin: string) {
     });
     pyMod["no_loading_indicator"] = pyCall(_NoLoadingIndicator);
 
+    // @ts-expect-error
+    const invalidatedMacs = (pyMod["__anvil$doInvalidatedMacs"] = () => {
+        console.log("Invalidated MACs!");
+        pyMod["_n_invalidations"] = toPy(pyMod["_n_invalidations"].valueOf() + 1);
+
+        return pyIterFor(pyMod["_invalidation_callbacks"].tp$iter(), (f) => pyCallOrSuspend(f, []));
+    });
+
     /*!defFunction(anvil.server,!_)!2*/ ("Reset the current session to prevent further SessionExpiredErrors.");
     pyMod["reset_session"] = new pyFunc(function () {
         // Prevent the session from complaining about expiry.
-        return PyDefUtils.suspensionFromPromise(
-            PyDefUtils.callAsync(
-                pyMod["call_s"],
-                undefined,
-                undefined,
-                undefined,
-                toPy("anvil.private.reset_session")
-            ).then((r) => {
-                window.anvilSessionToken = toJs(r as pyStr);
-                return pyNone;
-            })
+        return chainOrSuspend(
+            pyCallOrSuspend(pyMod["call_s"], [new pyStr("anvil.private.reset_session")]),
+            (token: pyStr) => {
+                window.anvilSessionToken = toJs(token);
+                return invalidatedMacs();
+            },
+            () => pyNone
+        );
+    });
+
+    pyMod["_invalidation_callbacks"] = new pyList();
+    pyMod["_on_invalidate_client_objects"] = new pyFunc(function (f) {
+        pyCall(pyMod["_invalidation_callbacks"].tp$getattr<pyList>(new pyStr("append")), [f]);
+        return pyNone;
+    });
+
+    pyMod["invalidate_client_objects"] = new pyFunc(function () {
+        return chainOrSuspend(
+            doServerCall([], [], "anvil.private.invalidate_client_objects"),
+            invalidatedMacs,
+            () => pyNone
         );
     });
 
@@ -574,6 +628,17 @@ module.exports = function (appId: string, appOrigin: string) {
             $doc: "decorator for marking a function as an event handler.",
             $flags: { OneArg: true },
         },
+        __getattr__: {
+            $meth(pyName) {
+                const name = pyName.toString();
+                if (name === "startup_data") {
+                    // this needs to be lazy - because appStartupData doesn't exist until after the app has started
+                    return data.appStartupData ?? pyNone;
+                }
+                throw new pyAttributeError(name);
+            },
+            $flags: { OneArg: true },
+        },
     });
 
     // Old name, for apps written before portable classes were released
@@ -581,10 +646,18 @@ module.exports = function (appId: string, appOrigin: string) {
 
     const getAppOrigin = (pyEnvironmentType: pyStr | pyNoneType, pyPreferEmphemeralDebug: pyBool) => {
         if (pyEnvironmentType === pyNone) {
-            return toPy(isTrue(pyPreferEmphemeralDebug) ? window.anvilAppOrigin : (window.anvilEnvironmentOrigin || window.anvilAppOrigin));
+            return toPy(
+                isTrue(pyPreferEmphemeralDebug)
+                    ? window.anvilAppOrigin
+                    : window.anvilEnvironmentOrigin || window.anvilAppOrigin
+            );
         }
-        return pyCallOrSuspend(pyMod["call_s"], [toPy("anvil.private.get_app_origin"), pyEnvironmentType], ["prefer_ephemeral_debug", pyPreferEmphemeralDebug]);
-    }
+        return pyCallOrSuspend(
+            pyMod["call_s"],
+            [toPy("anvil.private.get_app_origin"), pyEnvironmentType],
+            ["prefer_ephemeral_debug", pyPreferEmphemeralDebug]
+        );
+    };
 
     pyMod["get_app_origin"] = new pyFunc(function (pyEnvironmentType, pyPreferEmphemeralDebug) {
         return getAppOrigin(pyEnvironmentType, pyPreferEmphemeralDebug);
@@ -593,8 +666,10 @@ module.exports = function (appId: string, appOrigin: string) {
     pyMod["get_app_origin"].func_code.$defaults = [pyNone, pyNone];
 
     pyMod["get_api_origin"] = new pyFunc(function (pyEnvironmentType, pyPreferEmphemeralDebug) {
-        return chainOrSuspend(getAppOrigin(pyEnvironmentType, pyPreferEmphemeralDebug),
-            (pyOrigin) => new pyStr(pyOrigin.toString() + "/_/api"));
+        return chainOrSuspend(
+            getAppOrigin(pyEnvironmentType, pyPreferEmphemeralDebug),
+            (pyOrigin) => new pyStr(pyOrigin.toString() + "/_/api")
+        );
     });
     pyMod["get_api_origin"].func_code.co_varnames = ["branch", "prefer_ephemeral_debug"]; // As above
     pyMod["get_api_origin"].func_code.$defaults = [pyNone, pyNone];
@@ -631,6 +706,37 @@ module.exports = function (appId: string, appOrigin: string) {
             location: null,
             ip: null,
         }),
+    });
+
+    pyMod["server_side_method"] = buildNativeClass("server_side_method", {
+        constructor: function server_side_method() {},
+        slots: {
+            tp$init(args, kws) {
+                if (args.length != 1 || kws?.length) {
+                    throw new TypeError("@server_side_method takes no arguments, just a function");
+                }
+            },
+            tp$descr_get(obj, type) {
+                return pyCallOrSuspend(this._get_fn, [obj, type]);
+            },
+        },
+        methods: {
+            __set_name__: {
+                $meth(owner, name) {
+                    const cname = `anvil.server_side/${Sk.abstr.gattr(owner, s__module__)}.${Sk.abstr.gattr(
+                        owner,
+                        s__name__
+                    )}.${name}`;
+                    this._get_fn = new pyFunc(
+                        PyDefUtils.withRawKwargs(function (pyKwargs: Kws, ...args: Args) {
+                            return doServerCall(pyKwargs, args, cname);
+                        })
+                    ).tp$getattr(s__get__);
+                    return pyNone;
+                },
+                $flags: { MaxArgs: 2, MinArgs: 2 },
+            },
+        },
     });
 
     // Register the component types (and ComponentTag) as serializable
@@ -675,7 +781,7 @@ module.exports = function (appId: string, appOrigin: string) {
         pyValueTypes["anvil." + componentName] = pyClass;
     }
 
-    return { pyMod, log: sendLog };
+    return { pyMod, log: sendLog, registerServerCallSuspension, setOnDebuggerMessage };
 };
 
 /*#

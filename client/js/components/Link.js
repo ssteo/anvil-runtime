@@ -1,6 +1,7 @@
 "use strict";
 import { getCssPrefix } from "@runtime/runner/legacy-features";
 import { setHandled, isHandled } from "./events";
+import { getUnsetPadding, setElementPadding } from "@runtime/runner/components-in-js/public-api/property-utils";
 var PyDefUtils = require("PyDefUtils");
 const { isTrue } = Sk.misceval;
 
@@ -58,6 +59,7 @@ module.exports = (pyModule) => {
                     holder.style.display = v ? "inline-block" : "none";
                 },
                 inlineEditElement: 'holder',
+                group: undefined,
             },
             url: /*!componentProp(Link)!1*/ {
                 name: "url",
@@ -89,6 +91,21 @@ module.exports = (pyModule) => {
                     }
                 },
             },
+            text_padding: /*!componentProp(Link)!1*/ {
+                group: "layout",
+                name: "text_padding",
+                type: "padding",
+                hidden: localStorage.previewSpacingProperties !== 'true',
+                description: "Padding for the link text. Only available in apps that have been migrated to use Layouts.",
+                defaultValue: Sk.builtin.none.none$,
+                priority: 0,
+                set(s, e, v) {
+                    setElementPadding(s._anvil.elements.holder, v);
+                },
+                getUnset(s, e, v) {
+                    return getUnsetPadding(s._anvil.elements.holder, v);
+                },
+            }
         }),
 
         events: PyDefUtils.assembleGroupEvents(/*!componentEvents(Link)!1*/ "Link", ["universal"], {
@@ -102,6 +119,7 @@ module.exports = (pyModule) => {
                             "A dictionary of keys including 'shift', 'alt', 'ctrl', 'meta'. " +
                             "Each key's value is a boolean indicating if it was pressed during the click event. " +
                             "The meta key on a mac is the Command key",
+                        important: false,
                     },
                 ],
                 important: true,
@@ -113,6 +131,7 @@ module.exports = (pyModule) => {
             const prefix = getCssPrefix();
             const outerClass = PyDefUtils.getOuterClass(props);
             const outerStyle = PyDefUtils.getOuterStyle(props);
+            const textPaddingStyle = PyDefUtils.getPaddingStyle({padding: props.text_padding});
             const outerAttrs = PyDefUtils.getOuterAttrs(props);
             const initialText = (props.text = Sk.builtin.checkNone(props.text) ? "" : props.text.toString());
             const colSpacing = prefix + "col-padding-" + col_spacing.toString();
@@ -130,7 +149,7 @@ module.exports = (pyModule) => {
                     style={outerStyle}
                     {...outerAttrs}>
                     <PyDefUtils.IconComponent side="left" {...props} />
-                    <div refName="holder" className={`${prefix}link-text` }style={`display: ${ initialText ? 'inline-block' : 'none'}; ${underlineStyle}`}>
+                    <div refName="holder" className={`${prefix}link-text` } style={textPaddingStyle + `display: ${ initialText ? 'inline-block' : 'none'}; ${underlineStyle}`}>
                         {Sk.builtin.checkNone(props.text) ? "" : props.text.toString()}
                     </div>
                     <PyDefUtils.IconComponent side="right" {...props} />
@@ -140,18 +159,15 @@ module.exports = (pyModule) => {
 
         locals($loc) {
             $loc["__new__"] = PyDefUtils.mkNew(pyModule["ColumnPanel"], (self) => {
-                self._anvil.element.on(
-                    "click",
-                    PyDefUtils.funcWithPopupOK((e) => {
-                        if (isHandled(e)) return;
-                        setHandled(e);
-                        PyDefUtils.raiseEventAsync(
-                            { keys: { meta: e.metaKey, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } },
-                            self,
-                            "click"
-                        );
-                    })
-                );
+                self._anvil.element.on("click", (e) => {
+                    if (isHandled(e)) return;
+                    setHandled(e);
+                    PyDefUtils.raiseEventAsync(
+                        { keys: { meta: e.metaKey, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } },
+                        self,
+                        "click"
+                    );
+                });
                 self._anvil.pageEvents = {
                     remove() {
                         if (self._anvil.urlHandle) {

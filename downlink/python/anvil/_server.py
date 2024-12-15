@@ -155,6 +155,22 @@ class LiveObjectProxy(anvil.LiveObject):
                 l += 1
             return l
 
+_n_invalidations = 0
+_invalidation_callbacks = []
+
+def _on_invalidate_client_objects(f):
+    _invalidation_callbacks.append(f)
+
+def _run_invalidated_client_objects_callbacks():
+    global _n_invalidations
+    _n_invalidations += 1
+    for f in _invalidation_callbacks:
+        f()
+
+def invalidate_client_objects():
+    _do_call([], None, fn_name="anvil.private.invalidate_client_objects")
+    _run_invalidated_client_objects_callbacks()
+
 
 # Wildcard for unwrap_capability
 class _CapAny(object):
@@ -163,7 +179,7 @@ class _CapAny(object):
 
 def _check_valid_scope(scope, name="scope"):
     if type(scope) is not list:
-            raise TypeError("The {} of a Capabilty must be a list".format(name))
+            raise TypeError("The {} of a Capability must be a list".format(name))
     try:
         return json.loads(json.dumps(scope))
     except TypeError as e:
@@ -187,10 +203,15 @@ class Capability(object):
         self._do_get_update = None
         self._queued_update = {}
         self._hash = None
+        self._n_invalidations = _n_invalidations
 
     @property
     def scope(self):
         return self._scope + self._narrow
+    
+    @property
+    def is_valid(self):
+        return self._n_invalidations == _n_invalidations
 
     def narrow(self, narrowing_suffix):
         narrowing_suffix = _check_valid_scope(narrowing_suffix, "narrow argument")
@@ -254,7 +275,7 @@ def unwrap_capability(cap, scope_pattern):
         raise ValueError("Capability is too narrow: required %s; got %s" % (scope_pattern, scope))
 
     for i in range(len(scope)):
-        if scope_pattern[i] is Capability.ANY or scope[i] == scope_pattern[i]:
+        if scope_pattern[i] is Capability.ANY or scope[i] == scope_pattern[i] or type(scope_pattern[i]) is tuple and scope[i] == list(scope_pattern[i]):
             ret[i] = scope[i]
         else:
             raise ValueError("Incorrect Capability: required %s; got %s" % (scope_pattern, cap.scope))
@@ -415,6 +436,7 @@ class SerializeWithIdentity(object):
         return [my_id, data]
 
 
+#!defFunction(anvil.server,%,[name])!2: {anvil$args: {name: "A unique name under which the class will be registered."}, $doc: "When applied to a class as a decorator, the class becomese available to be passed from server to client code."} ["portable_class"]
 def portable_class(cls, name=None):
     def register(cls, name):
         if not hasattr(cls, "__new__"):
@@ -440,14 +462,13 @@ serializable_type = portable_class
 
 class LazyMedia(anvil.Media):
     def __init__(self, spec):
-        if isinstance(spec,LazyMedia):
+        if isinstance(spec, LazyMedia):
             spec = spec._spec
         self._spec = spec
-        self._details = None
         self._fetched = None
 
     def _fetch(self):
-        if self._details is None:
+        if self._fetched is None:
             import anvil.server
             self._fetched = anvil.server.call("anvil.private.fetch_lazy_media", self._spec)
         return self._fetched
@@ -464,6 +485,7 @@ class LazyMedia(anvil.Media):
             raise _deserialise_exception(e.error_obj)
 
     def get_url(self, download=True):
+        import anvil.server
         return anvil.server.call("anvil.private.get_lazy_media_url", self, download)
 
     def get_content_type(self):
@@ -474,7 +496,10 @@ class LazyMedia(anvil.Media):
 
     def get_length(self):
         try:
-            return self._get("length")
+            rv = self._get("length")
+            if rv is not None:
+                return rv
+            return self._fetch().get_length()
         except AnvilWrappedError as e:
             raise _deserialise_exception(e.error_obj)
 
@@ -684,6 +709,7 @@ def _report_exception(request_id=None):
     trace.reverse()
 
     # Last element of trace is where we called into user code. Remove it.
+    # TODO account for debugger here
     trace.pop()
 
     if isinstance(exc_value, AnvilWrappedError):
@@ -1171,6 +1197,19 @@ def _reconstruct_objects(json, reconstruct_data_media, hold_back_value_types=Fal
 on_register = None # optional
 registrations = {}
 
+registrations = {}
+
+_registration_warning = "Warning: a callable with the name {!r} has already been registered (previously by {!r} now by {!r})."
+_warnings = []
+
+def _add_to_register(name, fn, ignore_warnings=False):
+    if not ignore_warnings and name in registrations and name not in _warnings:
+        prev = registrations[name]
+        print(_registration_warning.format(name, "%s.%s" % (prev.__module__, prev.__name__), "%s.%s" % (fn.__module__, fn.__name__)))
+        _warnings.append(name)
+    registrations[name] = fn
+
+
 class HttpRequest(object):
 
     def __init__(self):
@@ -1186,7 +1225,7 @@ class HttpRequest(object):
     def body_json(self):
         if hasattr(self, "_body_json"):
             return self._body_json
-        elif self.body is not None and self.headers.get("content-type", None) == "application/json":
+        elif self.body is not None and self.headers.get("content-type", "").split(";")[0] == "application/json":
             self._body_json = json.loads(self.body.get_bytes())
         else:
             self._body_json = None
@@ -1254,6 +1293,53 @@ class HttpResponse(object):
         else:
             raise TypeError("headers should be set to a dictionary")
 
+
+def _ensure_only_kws(class_name, args, kwargs, expected_kwargs):
+    if args:
+        raise TypeError("{}() takes keyword arguments only".format(class_name))
+    for key in kwargs:
+        if key not in expected_kwargs:
+            raise TypeError("{}() got an unexpected keyword argument '{}'".format(class_name, key))
+
+# Private API
+@portable_class("anvil.server._LoadAppResponse")
+class _LoadAppResponse(object):
+    def __init__(self, **kws):
+        self.__dict__.update(kws)
+
+
+#!defFunction(anvil.server,%,[form],*args,**kws)!2:
+# {
+#   $doc: "Open the specified form as a new page from a route.\n\n'form' is a string, and when received by the client the new form will be created (extra arguments will be passed to its constructor).",
+#   anvil$helpLink: "/docs/"
+# } ["FormResponse"]
+def FormResponse(form_name, *args, **kwargs):
+    return _LoadAppResponse(form=form_name, args=args, kwargs=kwargs)
+
+
+class AppResponder(object):
+    #!defMethod(_, data=None, meta=None)!2: ("Create an AppResponder object") ["__init__"];
+    def __init__(self, *args, **kws):
+        # because keyword only syntax is not supported in python2
+        _ensure_only_kws("AppResponder", args, kws, ["data", "meta"])
+        self.data = kws.get("data")
+        self.meta = kws.get("meta")
+
+    #!defMethod(_, [form], *args, **kwargs)!2: ("Open the specified form as a new page from a route") ["load_form"];
+    def load_form(self, form_name, *args, **kwargs):
+        return _LoadAppResponse(
+            data=self.data, meta=self.meta, form=form_name, args=args, kwargs=kwargs
+        )
+
+    #!defMethod(_, module_name)!2: ("Opens the specified module as a new page from a route") ["load_module"];
+    def load_module(self, module_name):
+        return _LoadAppResponse(data=self.data, meta=self.meta, module=module_name)
+
+    #!defMethod(_)!2: ("Loads an app at it's startup form/module") ["load_app"]; 
+    def load_app(self):
+        return _LoadAppResponse(data=self.data, meta=self.meta)
+
+#!defClass(anvil.server,%AppResponder)!0:
 
 class CallContext(object):
     class ClientInfo(object):
@@ -1354,6 +1440,7 @@ def register(fn, name=None, name_prefix=None, require_user=None):
 
     if require is not None:
         def require_wrap(f):
+            @functools.wraps(f)
             def with_req(*args, **kwargs):
                 if require():
                     return f(*args, **kwargs)
@@ -1364,27 +1451,27 @@ def register(fn, name=None, name_prefix=None, require_user=None):
         def require_wrap(f):
             return fn
 
-    registrations[name] = require_wrap(fn)
+    _add_to_register(name, require_wrap(fn))
 
     if on_register is not None:
         on_register(name, False)
 
     def reregister(new_f):
-        registrations[name] = require_wrap(new_f)
+        _add_to_register(name, require_wrap(new_f), ignore_warnings=True)
         new_f._anvil_reregister = reregister
 
     fn._anvil_reregister = reregister
 
     return fn
 
-#!defFunction(anvil.server,%,[name], [require_user])!2: {anvil$args: {fn_or_name: "The name by which you want to call your function from the client.", require_user: "Allows you to verify whether a user is logged in. Can be a boolean or a function."}, anvil$helpLink: "server#calling-server-functions-from-client-code", $doc: "When applied to a function as a decorator, the function becomes available from the client side."} ["callable"]
+#!defFunction(anvil.server,%,[fn_or_name], [require_user])!2: {anvil$args: {fn_or_name: "The name by which you want to call your function from the client.", require_user: "Allows you to verify whether a user is logged in. Can be a boolean or a function."}, anvil$helpLink: "/docs/server#calling-server-functions-from-client-code", $doc: "When applied to a function as a decorator, the function becomes available from the client side."} ["callable"]
 def callable(fn_or_name=None, require_user=None):
     if fn_or_name is None or isinstance(fn_or_name, string_type):
         return lambda f: register(f, fn_or_name, require_user=require_user)
     else:
         return register(fn_or_name)
 
-
+#!defFunction(anvil.server,%,[fn_or_name])!2: {anvil$args: {fn_or_name: "The name by which you want to call your function."}, anvil$helpLink: "/docs/background-tasks", $doc: "When applied to a function as a decorator, the function becomes available to run in the background."} ["background_task"]
 def background_task(fn_or_name=None):
     if fn_or_name is None or isinstance(fn_or_name, string_type):
         return lambda f: register(f, fn_or_name, name_prefix="task")
@@ -1409,6 +1496,7 @@ def http_endpoint(path, require_credentials=False, authenticate_users=False, aut
 
         path_regex = re.sub(":([^/]*)", register_path_part, path)
 
+        @functools.wraps(fn)
         def wrapped_fn(method, path, query_params, form_params, origin, headers, remote_address, body, username, password, same_app_alternate_origin=None, **more_kwargs):
 
             api_request._prevent_access = False
@@ -1498,7 +1586,9 @@ def http_endpoint(path, require_credentials=False, authenticate_users=False, aut
     return decorator
 
 
-wellknown_endpoint = functools.partial(http_endpoint, _task_prefix = "http-wellknown")
+wellknown_endpoint = functools.partial(http_endpoint, _task_prefix="http-wellknown")
+
+route = functools.partial(http_endpoint, _task_prefix="route")
 
 
 class AnvilCookie(object):
@@ -1608,3 +1698,26 @@ def plotly_serialization_helper(class_fullname):
 
 
 _serialization_helpers["plotly.graph_objs"] = plotly_serialization_helper
+
+
+class server_side_method:
+    """Decorator to wrap functions that should be executed on the server-side only"""
+    def __init__(self, func):
+        if func is not None and not hasattr(func, "__get__"):
+            raise TypeError("@server_side must be called with a function")
+        self._func = func
+
+    def __set_name__(self, owner, name):
+        import anvil.server, functools
+        cname = "anvil.server_side/" + owner.__module__ + "." + owner.__name__ + "." + name
+        func = self._func
+
+        @anvil.server.callable(cname)
+        @functools.wraps(self._func)
+        def server_func(*args, **kwargs):
+            if not args or not isinstance(args[0], owner):
+                raise TypeError("'self' argument to method must be " + owner)
+            return func(*args, **kwargs)
+
+    def __get__(self, instance, owner):
+        return self._func.__get__(instance, owner)

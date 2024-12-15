@@ -241,7 +241,7 @@ module.exports = function(pyModule) {
     }
 
     pyModule["Canvas"] = PyDefUtils.mkComponentCls(pyModule, "Canvas", {
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(Canvas)!1*/ ["layout", "height", "appearance", "user data", "tooltip"]),
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(Canvas)!1*/ ["layout", "layout_margin", "height", "appearance", "user data", "tooltip"]),
 
         events: PyDefUtils.assembleGroupEvents(/*!componentEvents()!2*/ "Canvas", ["universal", "mouse"], {
             reset: /*!componentEvent(Canvas)!1*/ {
@@ -249,7 +249,7 @@ module.exports = function(pyModule) {
                 description: "When the canvas is reset and cleared, such as when the window resizes, or the canvas is added to a form.",
                 parameters: [],
                 important: true,
-                defaultEvent: false,
+                defaultEvent: true,
             },
         }),
 
@@ -272,6 +272,11 @@ module.exports = function(pyModule) {
                 self._anvil.pageEvents = {
                     add() {
                         resizeObserver.observe(self._anvil.domNode);
+                        resetContext(self);
+                    },
+                    show() {
+                        // We need this because setting visible = True inside a show event must fire resetContext
+                        // relying on the resizeObserver here is not enough
                         resetContext(self);
                     },
                     remove() {

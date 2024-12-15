@@ -29,6 +29,7 @@ export const {
         super_: pySuper,
 
         getset_descriptor: pyGetSetDescriptor,
+        wrapper_descriptor: pyWrapperDescriptor,
 
         classmethod: pyClassMethod,
         staticmethod: pyStaticMethod,
@@ -106,6 +107,7 @@ export const {
         arrayFromIterable,
         asyncToPromise: suspensionToPromise,
         promiseToSuspension,
+        iterFor: pyIterFor,
     },
     abstr: {
         buildNativeClass,
@@ -123,7 +125,7 @@ export const {
         setUpModuleMethods,
         objectHash: pyObjectHash,
     },
-    ffi: { toPy, toJs, proxy },
+    ffi: { toPy, toJs, proxy, remapToJsOrWrap },
     importModule,
 } = Sk;
 
@@ -222,6 +224,7 @@ export interface pyIterator<T = pyObject> extends pyIterable<T> {
 
 export interface pySuperConstructor extends pyType<pySuper> {
     new <I extends pyObject>(a: pyType<I>, b: I): pySuper;
+    new (a: pyType, b: pyType): pySuper;
 }
 
 export interface pySuper extends pyObject {
@@ -234,6 +237,19 @@ export interface pyGetSetDescriptorConstructor<I extends pyObject = pyObject> ex
 }
 
 export interface pyGetSetDescriptor extends pyObject {}
+
+export interface WrapperDescriptorDef<I> {
+    $wrapper: (this: (...args: any[]) => any, self: I, args: Args, kws: Kws) => pyObject | Suspension;
+    $flags: Flags;
+    $name?: string;
+    $textsig?: string;
+    $doc?: string;
+}
+export interface pyWrapperDescriptorConstructor<I extends pyObject = pyObject> extends pyType<pyWrapperDescriptor> {
+    new (t: pyType<I>, def: WrapperDescriptorDef<I>, wrapper: (...args: Args) => any): pyGetSetDescriptor;
+}
+
+export interface pyWrapperDescriptor extends pyObject {}
 
 export interface pyStrConstructor extends pyType<pyStr> {
     new (s?: string | pyObject): pyStr;
@@ -377,7 +393,7 @@ export interface pyFloat extends pyObject {
 }
 
 export interface pyDictConstructor extends pyType<pyDict> {
-    new (entries?: pyObject[]): pyDict;
+    new <K = pyObject, V = pyObject>(entries?: pyObject[]): pyDict<K, V>;
 }
 
 export interface pyDict<K = pyObject, V = pyObject> extends pyObject, pyIterable<K> {
@@ -856,11 +872,19 @@ export interface pyExternalError extends pyValueError {
     nativeError: any;
 }
 
-export interface Suspension {
+export interface Suspension<T=unknown> {
     $isSuspension: true;
+    data: T;
+    child?: Suspension<T>;
+    resume(): any;
+    $loc?: any;
+    $gbl?: any;
+    $filename?: string;
+    $lineno?: number;
+    $colno?: number;
 }
 export interface SuspensionConstructor {
-    new (): Suspension;
+    new <T>(): Suspension<T>;
 }
 
 export interface BreakConstructor {

@@ -20,7 +20,8 @@
     [anvil.runtime.ws-util :as ws-util]
     [anvil.runtime.sessions :as sessions]
     [anvil.runtime.app-log :as app-log]
-    [anvil.core.tracing :as tracing])
+    [anvil.core.tracing :as tracing]
+    [anvil.runtime.debugger :as debugger])
   (:import (java.util.regex PatternSyntaxException)))
 
 
@@ -120,6 +121,7 @@
           connection-cookie (atom nil)]
 
       (metrics/set! :api/runtime-connected-uplinks-total (swap! connected-uplink-count inc))
+      (ws-util/tag-channel! channel {:org-id -2}) ;; Use this to mean "connecting uplink" for now.
 
       (on-close channel
                 (fn [why]
@@ -145,7 +147,6 @@
       (on-receive channel
                   (fn [json-or-binary]
                     (worker-pool/set-task-info! :websocket ::receive)
-                    (ws-util/tag-channel! channel {:org-info -2}) ;; Use this to mean "connecting uplink" for now.
                     (when-not (is-closed?)
                       (log/trace "Uplink got data: " json-or-binary)
                       (try+
@@ -240,7 +241,16 @@
                                                 (let [{:keys [app-info environment default-session]} @connection]
                                                   (ws-calls/new-call-context :uplink-call app-info environment nil nil default-session)))
                                     call-stack-info (STACK-FRAME-INFO (:uplink-type @connection))
-                                    return-path {:update!  #(send! channel (util/write-json-str (assoc % :id call-id)))
+                                    return-path {:update!  (fn [{:keys [debuggers] :as update}]
+                                                             ;; catch top-level debug events (if this wasn't the root
+                                                             ;; call of this stack, they're diverted upstream already
+                                                             ;; by ws-calls/dispatch-request!)
+                                                             (if debuggers
+                                                               (when-not pending-response
+                                                                 (debugger/handle-debugger-update! (:environment @connection)
+                                                                                                   {:type (:stack-frame-type (STACK-FRAME-INFO (:uplink-type @connection)))}
+                                                                                                   debuggers nil))
+                                                               (send! channel (util/write-json-str (assoc update :id call-id)))))
                                                  :respond! #(do (serialisation/serialise-to-websocket! (assoc % :id call-id) channel true nil)
                                                                 (swap! outstanding-incoming-call-ids disj call-id)
                                                                 (maybe-disconnect-if-idle!))}
@@ -267,7 +277,7 @@
                           (send! channel (util/write-json-str {:error (:anvil/server-error e)}))
                           (log/warn "Closing uplink channel:" (:anvil/server-error e))
                           (close channel))
-                        (catch Exception e
+                        (catch Object e
                           (let [error-id (random/hex 6)]
                             (log/error e "Error processing message from uplink. Internal server error:" error-id)
                             (reset! internal-error error-id))

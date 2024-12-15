@@ -13,11 +13,11 @@ var $builtinmodule = window.memoise('stripe.checkout', function() {
     var loadKeys = PyDefUtils.defer();
     var anvil = PyDefUtils.getModule("anvil");
     var appPath = Sk.ffi.remapToJs(anvil.tp$getattr(new Sk.builtin.str("app_path")));
-    $.get(appPath + "/_/get_stripe_publishable_keys?s=" + window.anvilSessionToken, function(data) {
+    $.get(appPath + "/_/get_stripe_publishable_keys?_anvil_session=" + window.anvilSessionToken, function(data) {
     	loadKeys.resolve(data);
     });
 
-    var getToken = async function (kwargs) {
+    async function getToken(kwargs) {
         var stripeMod = PyDefUtils.getModule("stripe");
 
         var amount = kwargs["amount"];
@@ -90,7 +90,7 @@ var $builtinmodule = window.memoise('stripe.checkout', function() {
         if (stripeWillPopup && popupWillBeBlocked) {
             var cancelled = true;
 
-            const modal = new window.anvilModal({
+            const modal = await window.anvilModal.create({
                 id: "stripe-checkout-modal",
                 title: "Pay Online",
                 body: "You are about to make an online payment",
@@ -111,7 +111,7 @@ var $builtinmodule = window.memoise('stripe.checkout', function() {
                     checkoutCallbackDefer.reject();
                 }
             });
-            modal.show();
+            await modal.show();
         } else {
             loadKeys.promise.then(openHandler);
         }

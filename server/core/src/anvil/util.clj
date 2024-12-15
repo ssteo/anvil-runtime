@@ -1,7 +1,8 @@
 (ns anvil.util
   (:use [clojure.pprint]
         [slingshot.slingshot])
-  (:require [digest]
+  (:require [clj-yaml.core :as yaml]
+            [digest]
             [crawlers.detector :as crawlers]
             [anvil.runtime.conf :as conf]
             [clojure.data.json :as json]
@@ -10,25 +11,25 @@
             [ring.util.codec :as codec]
             [clojure.string :as string]
             [anvil.metrics :as metrics]
-            [clojure.core.cache.wrapped :as cache]
             [org.httpkit.client :as http]
             [org.httpkit.sni-client :as sni]
             [org.httpkit.sni-client :as https]
             [compojure.core]
+            [ring.middleware.gzip :as gzip]
             [clojure.java.io :as io])
   (:import (java.sql SQLException)
            (javax.crypto Mac)
            (javax.crypto.spec SecretKeySpec)
            (javax.net.ssl SSLContext)
            (org.mindrot.jbcrypt BCrypt)
-           (clojure.lang Keyword)
+           (clojure.lang IPersistentMap Keyword)
            (java.net InetAddress)
            (com.maxmind.db CHMCache)
            (com.maxmind.geoip2 DatabaseReader$Builder DatabaseReader)
-           (java.io File ByteArrayOutputStream ByteArrayInputStream FileOutputStream)
+           (java.io InputStream File ByteArrayOutputStream ByteArrayInputStream FileOutputStream)
            (com.maxmind.geoip2.exception GeoIp2Exception)
            (com.mchange.v2.c3p0 DataSources)
-           (java.util Properties Map)
+           (java.util LinkedHashMap Properties Map)
            (javax.sql DataSource)
            (java.time Instant ZoneOffset)
            (java.time.format DateTimeFormatter)
@@ -53,6 +54,15 @@
 (def insecure-client (http/make-client {}))
 (defn get-default-ssl-engine []
   (.createSSLEngine (SSLContext/getDefault)))
+
+;; Override clj-yaml encoder to sort map keys, so YAML is stable for git diffs.
+(extend-protocol yaml/YAMLCodec
+  IPersistentMap
+  (yaml/encode [data]
+    (let [lhm (LinkedHashMap.)]
+      (doseq [k (sort (keys data))]
+        (.put lhm (yaml/encode k) (yaml/encode (get data k))))
+      lhm)))
 
 ;; To define hookable functions, in runtime:
 ;;     (def set-foo-hooks! (hook-setter #{foo bar baz})
@@ -135,6 +145,15 @@
 (defn read-json-str [val]
   (json/read-str val :key-fn keyword))
 
+(def YAML-CODE-POINT-LIMIT 99999999)                        ; Override 3 MB default
+
+(defn parse-yaml-str [val & args]
+  (apply yaml/parse-string val :code-point-limit YAML-CODE-POINT-LIMIT args))
+
+(defn parse-yaml-bytes [^bytes val & args]
+  (when val
+    (apply parse-yaml-str (String. val) args)))
+
 (defn as-properties [kw-map]
   (let [p (Properties.)]
     (doseq [[k v] kw-map]
@@ -208,8 +227,8 @@
 (defmacro log-time [level message & body]
   `(let [start-time# (System/currentTimeMillis)
          val# (do ~@body)]
-    (log/logp ~level ~message (str "(" (- (System/currentTimeMillis) start-time#) " ms)"))
-    val#))
+     (log/logp ~level ~message (str "(" (- (System/currentTimeMillis) start-time#) " ms)"))
+     val#))
 
 (def TXN-RETRIES 26)                                        ; Max time ~30s. Probably.
 
@@ -230,10 +249,12 @@
                                    :serializable)
           [recur? r]
           (try+
-            (jdbc/with-db-transaction [db-c db-spec {:isolation actual-isolation-level}]
-              (let [db-c (if rollback-state (assoc db-c :anvil-quota-rollback-state rollback-state
-                                                        :anvil-txn-isolation-level actual-isolation-level) db-c)]
-                [false (f db-c)]))
+            (jdbc/with-db-transaction [db-c db-spec (if (= actual-isolation-level :read-only)
+                                                      {:isolation :read-committed :read-only? true}
+                                                      {:isolation actual-isolation-level})]
+                                      (let [db-c (if rollback-state (assoc db-c :anvil-quota-rollback-state rollback-state
+                                                                                :anvil-txn-isolation-level actual-isolation-level) db-c)]
+                                        [false (f db-c)]))
             (catch #(or (and (instance? SQLException %) (#{"40001" "40P01"} (.getSQLState %)))
                         (and (:anvil/server-error %) (= (:type %) "anvil.tables.TransactionConflict")))
                    e
@@ -245,10 +266,10 @@
                   (Thread/sleep (long (* (Math/random) (Math/pow 2 (* 0.5 (- TXN-RETRIES n))))))
                   [true nil])
                 (throw+ e)))
-            (catch Throwable e
+            (catch Object e
               (when rollback-state
                 (rollback-quota-changes! rollback-state))
-              (throw e)))]
+              (throw+ e)))]
       (if recur?
         (do
           (swap! total-txn-retries inc)
@@ -259,9 +280,12 @@
   `(-with-db-transaction ~spec ~isolation-level (fn [db#]
                                                   (let [~conn-sym db#]
                                                     ~@body))))
-(defonce db-locks (atom {})) ;; So we can look up locks by number if necessary
+(defonce db-locks (atom {}))                                ;; So we can look up locks by number if necessary
 
 (def ^:dynamic *db-locks* {})
+
+;; Only take the lock once for this whole VM, rather than tying up lots of DB connections
+(defonce db-lock-objects (atom {}))                         ;; lock name -> {:lock (Object.) :nrefs NUMBER}
 
 (defn -with-db-lock [lock-name flags f]
   (let [flags (if (boolean? flags) {:shared? flags} flags)
@@ -270,18 +294,31 @@
       (if (or (:shared? flags) (not (:shared? lock)))
         (f)
         (throw (Exception. (str "Tried to upgrade from a shared to an exclusive lock for " lock-name))))
-      (let [lock-number (.hashCode (str lock-name))]
+      (let [lock-number (.hashCode (str lock-name))
+            {lock-obj :lock} (when-not (or shared? try?)
+                               (-> (swap! db-lock-objects update lock-name (fn [lockmap]
+                                                                             (if lockmap
+                                                                               (update lockmap :nrefs inc)
+                                                                               {:lock (Object.) :nrefs 1})))
+                                   (get lock-name)))]
         (swap! db-locks assoc lock-number lock-name)
         (try
-          (jdbc/with-db-transaction [db-t db]               ;; Note that we don't actually use this txn connection for anything except locking.
-            (let [FN_NAME (str "pg_" (when try? "try_") "advisory_xact_lock" (when shared? "_shared"))
-                  gained-try-lock? (:success (first (jdbc/query db-t [(str "SELECT " FN_NAME "(?::bigint) AS success") lock-number])))]
-              (when (and try? (not gained-try-lock?))
-                (throw+ {:anvil/lock-unavailable lock-name}))
-              (binding [*db-locks* (assoc *db-locks* lock-name {:shared? shared?})]
-                (f))))
+          (locking (or lock-obj (Object.))
+            (jdbc/with-db-transaction [db-t db]             ;; Note that we don't actually use this txn connection for anything except locking.
+                                      (let [FN_NAME (str "pg_" (when try? "try_") "advisory_xact_lock" (when shared? "_shared"))
+                                            gained-try-lock? (:success (first (jdbc/query db-t [(str "SELECT " FN_NAME "(?::bigint) AS success") lock-number])))]
+                                        (when (and try? (not gained-try-lock?))
+                                          (throw+ {:anvil/lock-unavailable lock-name}))
+                                        (binding [*db-locks* (assoc *db-locks* lock-name {:shared? shared?})]
+                                          (f)))))
           (finally
-            (swap! db-locks dissoc lock-number)))))))
+            (swap! db-locks dissoc lock-number)
+            (when lock-obj
+              (swap! db-lock-objects (fn [dlo]
+                                       (let [{:keys [obj nrefs]} (get dlo lock-name)]
+                                         (if (or (nil? nrefs) (<= nrefs 1))
+                                           (dissoc dlo lock-name)
+                                           (update-in dlo [lock-name :nrefs] dec))))))))))))
 
 (defmacro with-db-lock [lock-name flags & body]
   `(-with-db-lock ~lock-name ~flags (fn [] ~@body)))
@@ -320,6 +357,22 @@
 ;; Not currently supported by ring-core - https://github.com/ring-clojure/ring/pull/479
 (def additional-mime-types
   {"wasm" "application/wasm" "woff2" "application/font-woff2"})
+
+
+;; https://github.com/bertrandk/ring-gzip/issues/10
+;; add support for other gzip types
+(defn- supported-type?
+  [resp]
+  (let [{:keys [headers body]} resp]
+    (or (string? body)
+        (seq? body)
+        (instance? InputStream body)
+        (and (instance? File body)
+             (re-seq #"(?i)\.(htm|html|css|js|json|xml|svg|wasm|woff|woff2)" (.getName body))))))
+
+;; Override the original function in the ring.middleware.gzip namespace
+(alter-var-root (ns-resolve 'ring.middleware.gzip 'supported-type?) (constantly supported-type?))
+
 
 (defn iso-instant [^Instant instant]
   (.format (.withZone (DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm:ss'Z'")
@@ -375,13 +428,6 @@
 
 (defmacro $ [a b c] `(~b ~a ~c))
 
-(defmacro defn-with-ttl-memoization [func args ttl & body]
-  `(def ~func
-     (let [ttl-cache# (cache/ttl-cache-factory {} :ttl ~ttl)]
-       (fn ~args
-         (-> (cache/through-cache ttl-cache# ~args (fn [~args] ~@body))
-             (get ~args))))))
-
 (defn dissoc-in-or-remove [map [key & more-keys]]
   (if (nil? key)
     nil
@@ -407,7 +453,7 @@
      (run []
        (try
          ~@body
-         (catch Exception e#
+         (catch Throwable e#
            (log/error e# "TimerTask error" ~error-context))))))
 
 (in-ns 'compojure.core)
@@ -420,7 +466,7 @@
 (defn wait-for [pred timeout check-ms]
   (let [timeout-time (+ (System/currentTimeMillis) timeout)]
     (while (and (not (pred))
-               (< (System/currentTimeMillis) timeout-time))
+                (< (System/currentTimeMillis) timeout-time))
       (Thread/sleep check-ms)))
   (pred))
 

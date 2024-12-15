@@ -41,24 +41,30 @@ var $builtinmodule = window.memoise('anvil.google.auth', function() {
     var mod = {};
 
     var loginCallbackResolve = null;
+    let googleButtonLoaded = false;
+    function loadGoogleSignInButton() {
+        if (googleButtonLoaded) return;
+        googleButtonLoaded = true;
+        PyDefUtils.loadScript(window.anvilAppOrigin + "/_/static/runtime/img/google-signin-buttons/btn.js?sha=277762afd28c6a94830")
+    }
 
     var scopes = [
         'https://www.googleapis.com/auth/userinfo.email',
         'https://www.googleapis.com/auth/userinfo.profile',
     ];
 
-    var displayLogInModal = function(additionalScopes) {
+    async function displayLogInModal(additionalScopes) {
 
         var anvil = PyDefUtils.getModule("anvil");
         var appPath = Sk.ffi.remapToJs(anvil.tp$getattr(new Sk.builtin.str("app_path")));
 
         var scopesToRequest = scopes.concat(additionalScopes || []).join(' ');
 
-        var doLogin = function() {
+        function doLogin() {
 
             var authParams = {
                 scope: scopesToRequest,
-                s: window.anvilSessionToken,
+                _anvil_session: window.anvilSessionToken,
             };
 
             var authUrl = appPath + "/_/client_auth_redirect?" + $.param(authParams);
@@ -91,28 +97,33 @@ var $builtinmodule = window.memoise('anvil.google.auth', function() {
         if (PyDefUtils.isPopupOK()) {
             doLogin();
         } else {
-            const body = `<button type="button" class="btn" data-dismiss="modal">
-                    <img src="${window.anvilCDNOrigin}/runtime/img/google-signin-buttons/btn_google_signin_light_normal_web.png?buildTime=0" crossorigin/>
-                </button>`;
-
-            const modal = new window.anvilModal({
+            loadGoogleSignInButton();
+            const modal = await window.anvilModal.create({
                 id: "google-login-modal",
                 backdrop: "static",
                 keyboard: false,
                 dismissible: false,
                 title: "Log in with Google",
                 body: true,
-                buttons: [{ text: "Cancel", onClick: () => {
-                    modal.once("hidden", () => loginCallbackResolve.reject("MODAL_CANCEL"));
-                }}],
+                buttons: [
+                    {
+                        text: "Cancel",
+                        onClick() {
+                            modal.once("hidden", () => loginCallbackResolve.reject("MODAL_CANCEL"));
+                        },
+                    },
+                ],
             });
             const { modalBody } = modal.elements;
-            modalBody.innerHTML = body;
-            modalBody.firstElementChild.addEventListener("click", doLogin);
+            const btn = document.createElement("google-signin-button");
+            btn.textContent = "Sign in with Google"; // not necessary - but if the web component were to fail - this would still render
+            modalBody.appendChild(btn);
+            btn.addEventListener("click", doLogin);
             modalBody.style.textAlign = "center";
-            modal.show();
+            await modal.show();
+            return modal;
         }
-    }
+    };
 
     var registerCallbackHandlers = function(messageFns) {
 
@@ -138,7 +149,7 @@ var $builtinmodule = window.memoise('anvil.google.auth', function() {
             var anvil = PyDefUtils.getModule("anvil");
             var appPath = Sk.ffi.remapToJs(anvil.tp$getattr(new Sk.builtin.str("app_path")));
 
-            $.get(appPath + "/_/client_auth_id_token?s=" + window.anvilSessionToken).done(function(idToken) {
+            $.get(appPath + "/_/client_auth_id_token?_anvil_session=" + window.anvilSessionToken).done(function(idToken) {
                 console.debug("Got app user ID token:", idToken);
                 if (loginCallbackResolve) {
                     loginCallbackResolve.resolve(idToken);
@@ -156,31 +167,35 @@ var $builtinmodule = window.memoise('anvil.google.auth', function() {
     mod["user_id"] = Sk.builtin.none.none$;
     mod["email"] = Sk.builtin.none.none$;
 
-    /*!defFunction(anvil.google.auth,!_,[additional_scopes])!2*/ "Prompt the user to log in with their Google account.\n\nIf you have specified your own client ID in the Google Service configuration, you can specify additional OAuth scopes for use with the Google REST API."
-    mod["login"] = new Sk.builtin.func(function(pyAdditionalScopes) {
+    async function login(pyAdditionalScopes) {
 
         // TODO: Try immediate auth before we do anything else. If that fails, then...
 
         loginCallbackResolve = PyDefUtils.defer();
 
-        displayLogInModal(Sk.ffi.remapToJs(pyAdditionalScopes || []));
+        const modal = await displayLogInModal(Sk.ffi.remapToJs(pyAdditionalScopes || []));
 
         // TODO: Should probably have a timeout on this promise.
 
-        return PyDefUtils.suspensionPromise(function(resolve, reject) {
-            loginCallbackResolve.promise.then(function(idToken) {
-                mod["user_id"] = Sk.ffi.remapToPy(idToken.user_id);
-                mod["email"] = Sk.ffi.remapToPy(idToken.email);
-                resolve(mod["email"]);
-            }).catch(function(e) {
-                if (e == "MODAL_CANCEL") {
-                    resolve(Sk.builtin.none.none$);
-                } else {
-                    reject(e);
-                }
-            });
-        });
-    });
+        try {
+            const idToken = await loginCallbackResolve.promise;
+            mod["user_id"] = Sk.ffi.remapToPy(idToken.user_id);
+            mod["email"] = Sk.ffi.remapToPy(idToken.email);
+            return mod["email"];
+        } catch (e) {
+            if (e === "MODAL_CANCEL") {
+                return Sk.builtin.none.none$;
+            } else {
+                throw e;
+            }
+        } finally {
+            modal && modal.hide();
+        }
+    }
+
+
+    /*!defFunction(anvil.google.auth,!_,[additional_scopes])!2*/ "Prompt the user to log in with their Google account.\n\nIf you have specified your own client ID in the Google Service configuration, you can specify additional OAuth scopes for use with the Google REST API."
+    mod["login"] = new Sk.builtin.func((pyAdditionalScopes) => PyDefUtils.suspensionFromPromise(login(pyAdditionalScopes)));
 
     registerCallbackHandlers(window.messages);
 

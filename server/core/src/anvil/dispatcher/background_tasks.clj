@@ -15,9 +15,11 @@
             [anvil.core.worker-pool :as worker-pool]
             [anvil.runtime.sessions :as sessions]
             [anvil.dispatcher.serialisation.blocking-hacks :as blocking-hacks]
-            [anvil.core.tracing :as tracing])
+            [anvil.core.tracing :as tracing]
+            [anvil.runtime.debugger :as debugger])
   (:use     [slingshot.slingshot :only [throw+ try+]])
   (:import (anvil.dispatcher.types DateTime)
+           (java.sql Timestamp)
            (java.util Date)
            (java.io StringWriter)))
 
@@ -43,7 +45,7 @@
 
 (defonce create-background-task-record
          (fn [_environment impl task-name session-id]
-           (when-let [oldest-to-keep ^java.sql.Timestamp (:start_time (last (jdbc/query util/db ["SELECT start_time FROM background_tasks WHERE completion_status IS NOT NULL ORDER BY start_time DESC LIMIT 1000"])))]
+           (when-let [oldest-to-keep ^Timestamp (:start_time (last (jdbc/query util/db ["SELECT start_time FROM background_tasks WHERE completion_status IS NOT NULL ORDER BY start_time DESC LIMIT 1000"])))]
              (clean-all-finished-tasks-older-than! (.getTime oldest-to-keep)))
            (let [new-id (str/lower-case (random/base32 25))]
              (map->BackgroundTask (first (jdbc/query util/db ["INSERT INTO background_tasks (id,session_id,routing,task_name,debug,start_time,last_seen_alive) VALUES (?,?,?::jsonb,?,FALSE,NOW(),NOW()) RETURNING *"
@@ -72,8 +74,8 @@
 (defn present-background-task [bt]
   (-> bt
       (select-keys [:id :completion_status :task_name :debug :session_id])
-      (assoc :last_seen_alive (.getTime (:last_seen_alive bt)))
-      (assoc :start_time (.getTime (:start_time bt)))
+      (assoc :last_seen_alive (.getTime ^Timestamp (:last_seen_alive bt)))
+      (assoc :start_time (.getTime ^Timestamp (:start_time bt)))
       (assoc :session_sha (util/sha-256 (str (:session bt))))))
 
 ;; Useful predicate for get-state
@@ -151,7 +153,7 @@
                                      [nil {:message "The state or return value could not be serialised"}])
                                    (catch :anvil/server-error e
                                      [nil {:message (:anvil/server-error e) :type (:type e)}])
-                                   (catch Exception e
+                                   (catch Object e
                                      (log/error e response)
                                      [nil {:message "An unknown serialisation error occurred"}]))
 
@@ -205,7 +207,7 @@
             req chunked-streams)))
 
 
-(def rpc-handlers {"anvil.private.background_tasks.launch"    {:fn (fn [{{[task-fn] :args} :call, :keys [origin from-bg-task? app-id environment session-state tracing-span], :as request} return-path]
+(def rpc-handlers {"anvil.private.background_tasks.launch"    {:fn (fn [{{[task-fn] :args} :call, :keys [origin from-bg-task? app-id environment session-state tracing-span bg-task-timeout], :as request} return-path]
                                                                      (worker-pool/run-task! {:type :native-rpc,
                                                                                              :name ::bg-task-launch-async-for-media-wait
                                                                                              :tags (worker-pool/get-task-tags-for-dispatch-request request)}
@@ -218,8 +220,8 @@
                                                                                                                           ;; TODO: Once BG tasks are sensible Portable Classes, we won't need this DB lookup, we can include the session ID in the wire format for the object.
                                                                                                                           (when-let [response-id (get-in resp [:response :id])]
                                                                                                                             (let [task-id (json/read-str response-id)
-                                                                                                                                session-id (:session_id (first (jdbc/query util/db ["SELECT session_id FROM background_tasks WHERE id = ?" task-id])))]
-                                                                                                                            (tracing/merge-span-attrs tracing-span {:task_id         task-id
+                                                                                                                                  session-id (:session_id (first (jdbc/query util/db ["SELECT session_id FROM background_tasks WHERE id = ?" task-id])))]
+                                                                                                                              (tracing/merge-span-attrs tracing-span {:task_id         task-id
                                                                                                                                                                       :task_session_id session-id})))
                                                                                                                           (dispatcher/respond! return-path resp)))]
                                                                            (when (= :client origin)
@@ -235,13 +237,14 @@
                                                                            (let [do-dispatch! (fn [] (dispatcher/dispatch! (-> request
                                                                                                                                (assoc-in [:call :func] (str "task:" task-fn))
                                                                                                                                (update-in [:call :args] rest)
-                                                                                                                               (assoc :background? true)
-                                                                                                                               (assoc :scheduled? (boolean (:scheduled-task-id request)))
-                                                                                                                               (assoc :bg-task-timeout (if restrict?
-                                                                                                                                                         30000
-                                                                                                                                                         nil))
-                                                                                                                               ;; It's useful to use the existing span here, because then we get all the task's executor info on *this* span, which has custom rendering anyway.
-                                                                                                                               (assoc :use-existing-tracing-span? true))
+                                                                                                                               (dissoc :thread-id)
+                                                                                                                               (assoc :background? true
+                                                                                                                                      :scheduled? (boolean (:scheduled-task-id request))
+                                                                                                                                      :bg-task-timeout (if restrict?
+                                                                                                                                                         (min 300 (or bg-task-timeout 300))
+                                                                                                                                                         bg-task-timeout)
+                                                                                                                                      ;; It's useful to use the existing span here, because then we get all the task's executor info on *this* span, which has custom rendering anyway.
+                                                                                                                                      :use-existing-tracing-span? true))
                                                                                                                            return-path))]
 
                                                                              (if-not restrict?
@@ -355,7 +358,9 @@
         task (create-background-task-record environment impl func (sessions/get-id new-session))
         _ (swap! new-session assoc-in [:client :background-task-id] (:id task))
 
-        return-path {:update!  (fn [{:keys [output]}]
+        return-path {:update!  (fn [{:keys [output debuggers]}]
+                                 (when debuggers
+                                   (debugger/handle-debugger-update! environment {:type "background_task"} debuggers nil))
                                  (when output
                                    (app-log/record-event! new-session (tracing/get-trace-id tracing-span) "print" output nil)))
                      :respond! (fn [{:keys [error] :as resp}]
@@ -390,7 +395,7 @@
        (catch :anvil/server-error e
          (record-final-state! session-state bt {:error {:message (:anvil/server-error e) :type (:type e)}} true)
          (swap! local-background-tasks dissoc (:id bt)))
-       (catch Exception e
+       (catch Object e
          (record-final-state! session-state bt {:error {:message "Internal error launching task"}} true)
          (swap! local-background-tasks dissoc (:id bt))
          (throw e)))
@@ -425,11 +430,11 @@
                                                   (let [return-path {:respond! #(dispatcher/respond! return-path (assoc % :taskState @(::task-state request)))
                                                                      :update!  #(dispatcher/update! return-path %)}]
                                                     (dispatcher/report-exceptions-to-return-path return-path
-                                                      (try+
+                                                      (try
                                                         (rpc-util/with-native-bindings-from-request request return-path
                                                           (binding [*native-bg-task-state* (::task-state rpc-util/*req*)]
                                                             (dispatcher/respond! return-path {:response (f)})))
-                                                        (catch InterruptedException e
+                                                        (catch InterruptedException _
                                                           (record-final-state! (:session-state request) (::task request) {:taskState @(::task-state request)} :killed))))))]
                                           (swap! local-background-tasks (fn [ts]
                                                                           (if (contains? ts (:id (::task request)))

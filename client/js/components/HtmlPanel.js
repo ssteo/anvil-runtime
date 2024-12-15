@@ -1,11 +1,12 @@
 "use strict";
 
-import {pyCall, pyDict, pyFunc, pyMappingProxy, pyNone, pyProperty, pyStr, toPy} from "@Sk";
-import { s_add_component, s_clear } from "../runner/py-util";
-import { Slot } from "../runner/python-objects";
-import { isInvisibleComponent } from "./helpers";
-import { validateChild } from "./Container";
 import { getCssPrefix } from "@runtime/runner/legacy-features";
+import { warn } from "@runtime/runner/warnings";
+import { pyCall, pyDict, pyMappingProxy, pyStr, remapToJsOrWrap, toPy } from "@Sk";
+import { pyPropertyFromGetSet, s_add_component, s_clear } from "../runner/py-util";
+import { Slot } from "../runner/python-objects";
+import { validateChild } from "./Container";
+import { isInvisibleComponent } from "./helpers";
 
 var PyDefUtils = require("PyDefUtils");
 
@@ -233,7 +234,7 @@ module.exports = (pyModule) => {
                         .then((r) => {
                             let jsR = undefined;
                             try {
-                                jsR = PyDefUtils.remapToJsOrWrap(r);
+                                jsR = remapToJsOrWrap(r);
                             } catch (e) {
                                 // ignore - throw below
                             }
@@ -252,27 +253,21 @@ module.exports = (pyModule) => {
 
 
                 self._anvil.pageEvents = {
-                    beforeAdd() {
+                    add() {
                         return loadScripts(self);
-
                     }
                 };
 
             });
 
-            $loc["slots"] = new Sk.builtin.property(
-                new Sk.builtin.func((self) => {
-                    return self._anvil.pyLayoutSlots;
-                })
-            );
+            $loc["slots"] = pyPropertyFromGetSet((self) => self._anvil.pyLayoutSlots);
 
             /*!defAttr()!1*/ ({name: "dom_nodes", type: "dict", description: "A read-only dictionary allowing you to look up the DOM node by name for any HTML tag in this component's HTML that has an anvil-name= attribute."});
-            $loc["dom_nodes"] = new pyProperty(
-                new pyFunc(self => self._anvil.pyElementsOverwrite ?? self._anvil.pyElements),
-                new pyFunc((self, value) => {
+            $loc["dom_nodes"] = pyPropertyFromGetSet(
+                (self) => self._anvil.pyElementsOverwrite ?? self._anvil.pyElements,
+                (self, value) => {
                     self._anvil.pyElementsOverwrite = value;
-                    return pyNone;
-                })
+                }
             );
 
             /*!defMethod(_,component,[slot="default"])!2*/ "Add a component to the named slot of this HTML templated panel. If no slot is specified, the 'default' slot will be used."
@@ -395,7 +390,7 @@ module.exports = (pyModule) => {
                 const s_copy = slotRecord.carrierElement = slotElt.cloneNode(true);
                 s_copy.removeAttribute("anvil-slot-repeat");
                 s_copy.setAttribute("anvil-slot-repeated", slotName);
-                const dropZone = s_copy.querySelector("[anvil-slot]");
+                const dropZone = s_copy.querySelector("[anvil-slot],[anvil-component-here]");
                 if (dropZone) {
                     dropZone.appendChild(celt);
                     if (ANVIL_IN_DESIGNER) {
@@ -416,7 +411,11 @@ module.exports = (pyModule) => {
                 };
                 let visibleDisplayState = s_copy.style.display;
                 setVisibility = (v) => {
-                    s_copy.style.display = v ? visibleDisplayState : "none";
+                    if (ANVIL_IN_DESIGNER) {
+                        s_copy.classList.toggle(getCssPrefix() + "visible-false", !v);
+                    } else {
+                        s_copy.style.display = v ? visibleDisplayState : "none";
+                    }
                 };
             } else {
                 if (insertingBeforeElement) {
@@ -526,7 +525,7 @@ module.exports = (pyModule) => {
                 const p = new Promise((resolve) => {
                     newScript.onload = resolve;
                     newScript.onerror = () => {
-                        Sk.builtin.print([new Sk.builtin.str(`Warning: failed to load script with src: ${oldScript.src}`)])
+                        warn(`Warning: failed to load script with src: ${oldScript.src}`);
                         console.error(`error loading ${oldScript.src}`);
                         resolve();
                     };

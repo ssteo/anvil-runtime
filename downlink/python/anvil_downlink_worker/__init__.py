@@ -1,5 +1,5 @@
 from __future__ import absolute_import
-import ast, sys, imp, importlib
+import ast, sys, importlib, time
 
 # The downlink may need to coexist with the Uplink (for example in the standalone App Server).
 # In these deployments, the downlink's version of the 'anvil' module is shipped as
@@ -11,6 +11,10 @@ sys.path = old_path
 
 import anvil.server
 from anvil import _server, _serialise, _threaded_server, _form_templating
+try:
+    from anvil import _debugger
+except ImportError:
+    _debugger = None
 
 if sys.version_info[0] < 3:
     from .exec2 import do_exec
@@ -19,6 +23,8 @@ else:
 
 _server._do_call = _threaded_server.do_call
 _serialise.holding_reqresps = True # Don't do anything until we've loaded apps
+
+ModuleType = type(sys)
 
 
 def find(lst, f):
@@ -56,7 +62,12 @@ class SimpleLoader(object):
 
         real_name = self._real_name or name
 
-        mod = self._module.get("module_object") or imp.new_module(real_name)
+        if real_name in sys.modules:
+            sys.modules[name] = sys.modules[real_name]
+            return sys.modules[name]
+
+        # convert to str here to avoid unicode error in python 2
+        mod = self._module.get("module_object") or ModuleType(str(real_name))
         sys.modules[real_name] = mod
         # Grungy horrid double-loading hack for Python 3
         if name != real_name:
@@ -77,6 +88,19 @@ class SimpleLoader(object):
         sys.modules[name] = mod
 
         return mod
+
+
+def mk_script_fn(script_name, script_code):
+    def run_script(*args):
+        if not all(type(arg) is str for arg in args):
+            raise ValueError("Only string arguments can be passed to scripts")
+        old_argv = sys.argv
+        sys.argv = args
+        try:
+            do_exec(compile(script_code, script_name + ".py", 'exec'), {"__name__": "__main__"})
+        finally:
+            sys.argv = old_argv
+    return run_script
 
 
 class AppModuleFinder(object):
@@ -104,7 +128,8 @@ class AppModuleFinder(object):
                 if modname in self._modules:
                     template_mod = self._modules[modname]['module_object']
                 else:
-                    template_mod = imp.new_module(modname)
+                    # convert to str here to avoid unicode error in python 2
+                    template_mod = ModuleType(str(modname))
                     self._modules[modname] = {'module_object': template_mod}
 
             leaf_name = form['class_name'].split(".")[-1]
@@ -145,15 +170,25 @@ class AppModuleFinder(object):
         mod = self._modules.get(self._main_package+"."+name)
         if mod is not None:
             return SimpleLoader(mod, self._main_package+"."+name)
+    
+    def find_spec(self, name, path=None, target=None):
+        from importlib.util import spec_from_loader
+        loader = self.find_module(name, path)
+        if loader is not None:
+            return spec_from_loader(name, loader)
 
     def app_is_loaded(self):
         return self._app is not None
+
+    def get_scripts(self):
+        return [(s['name'], s['code']) for s in self._app.get("scripts", [])]
 
 
 module_finder = AppModuleFinder()
 sys.meta_path.append(module_finder)
 
 modules_to_import = []
+
 
 def load_app(app):
     global modules_to_import
@@ -179,15 +214,24 @@ def load_app_modules():
     """Call from _threaded_server when the environment is ready to import all server modules in this app"""
     global _initial_import_done
     if _initial_import_done: return
+
+    start_import = time.time()
     try:
         for n in modules_to_import:
             importlib.import_module(n)
     except ErrorLoadingUserCode as e:
         raise e.exc
+
+    for name, code in module_finder.get_scripts():
+        anvil.server.background_task("script:"+name)(mk_script_fn(name, code))
+
     _initial_import_done = True
+    end_import = time.time()
+    return int((end_import - start_import) * 1000)
 
 
 repl_scopes = {}
+
 
 def run_repl(code, scope):
     module_ast = ast.parse(code, "<input>", "exec")
@@ -245,8 +289,19 @@ def handle_incoming_call(msg, send_to_host):
         send_to_host({"id": msg['id'], "response": None})
         return
 
+    elif msg['type'] == "DEBUG_REQUEST":
+        if _debugger:
+            response = _debugger.handle_debug_request(msg, file_prefix=module_finder.get_main_package()+"/")
+        else:
+            response = {"error": "Debugger not found"}
+
+        response["id"] = msg['id']
+        send_to_host(response)
+        return
+
     try:
         _threaded_server.IncomingRequest(msg, load_app_modules,
+                                         get_file_prefix=lambda: module_finder.get_main_package()+"/",
                                          run_fn=run_fn,
                                          dump_task_state=(msg['type'].startswith("LAUNCH_BACKGROUND")))
     except:

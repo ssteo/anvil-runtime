@@ -4,13 +4,25 @@
 // Copyright 2020 Kane Cohen <https://github.com/KaneCohen>
 // Available under BSD-3-Clause license
 
+import {
+    addEventHandler,
+    Component,
+    notifyComponentMounted,
+    notifyComponentUnmounted,
+} from "@runtime/components/Component";
 import { getCssPrefix } from "@runtime/runner/legacy-features";
+import { anvilMod, s_add_component } from "@runtime/runner/py-util";
+import { chainOrSuspend, pyCallOrSuspend, pyObject, pyStr, Suspension } from "@Sk";
+import { asyncToPromise } from "PyDefUtils";
+
+const s_click = new pyStr("click");
+const s_alert_footer_buttons = new pyStr("anvil.alerts.FooterButton");
 
 function reflow(element: HTMLElement) {
     element.offsetHeight;
 }
 
-type Listener = (this: EventEmitter, ...args: any[]) => void;
+type Listener = (this: EventEmitter, ...args: any[]) => Promise<void> | void;
 
 const EVENTS = Symbol();
 
@@ -25,9 +37,9 @@ class EventEmitter {
         this[EVENTS][event]?.delete(listener);
     }
 
-    emit(event: string, ...args: any[]) {
+    async emit(event: string, ...args: any[]) {
         for (const listener of this[EVENTS][event] ?? []) {
-            listener.apply(this, args);
+            await listener.apply(this, args);
         }
     }
 
@@ -49,8 +61,8 @@ const DEFAULT_OPTIONS = {
     title: null as string | null,
     dismissible: true,
     body: true as boolean | string,
-    buttons: [] as { text: string; style?: string; onClick?: (e: MouseEvent) => void }[],
-    // footer: false,
+    showFooter: false,
+    buttons: [] as { text: string; style?: string; onClick?: () => void }[],
 };
 
 let ANIMATE_CLASS = "fade";
@@ -69,9 +81,9 @@ function setPrefix() {
     ANIMATE_IN_CLASS = prefix + ANIMATE_IN_CLASS;
 }
 
-
 const BACKDROP_TRANSITION = 150;
 const TRANSITION = 300;
+const KNOWN_ELEMENTS_TO_INERT = ["appGoesHere", "anvil-header", "anvil-badge"];
 
 function calcScrollbarWidth() {
     const outer = document.createElement("div");
@@ -123,23 +135,24 @@ interface AlertProps {
     id?: string | number;
     large?: boolean | null;
     title?: string | null;
-    footer?: boolean;
+    showFooter?: boolean;
     dismissible?: boolean;
     body?: boolean | string;
 }
 
 const DISPLAY_NONE = { style: "display: none;" };
 
-function AlertModal({ id, large, title, footer, dismissible, body }: AlertProps) {
+function AlertModal({ id, large, title, showFooter, dismissible, body }: AlertProps) {
     id = !id ? "alert-modal" : typeof id === "string" ? id : "alert-modal-" + id;
     const bodyVisible = body == null ? DISPLAY_NONE : {};
     const titleVisible = title == null ? DISPLAY_NONE : {};
-    const footerVisible = footer ? {} : DISPLAY_NONE;
+    const footerVisible = showFooter ? {} : DISPLAY_NONE;
     const closeVisible = dismissible ? {} : DISPLAY_NONE;
     const size = large == null ? "" : `${prefix}modal-${large ? "lg" : "sm"}`;
+    const className = `${prefix}modal ${prefix}fade ${prefix}alert-modal`;
     return (
-        <div refName="modal" id={id} className={`${prefix}modal ${prefix}fade ${prefix}alert-modal`} style={ALERT_MODAL_ZINDEX}>
-            <div refName="modalDialog" className={`${prefix}modal-dialog ${size}`}>
+        <div refName="modal" id={id} className={className} style={ALERT_MODAL_ZINDEX}>
+            <div refName="modalDialog" tabIndex={0} className={`${prefix}modal-dialog ${size}`}>
                 <div refName="modalContent" className={`${prefix}modal-content`}>
                     <div refName="modalHeader" className={`${prefix}modal-header`} {...titleVisible}>
                         <button
@@ -161,7 +174,7 @@ function AlertModal({ id, large, title, footer, dismissible, body }: AlertProps)
                     </div>
                     <div
                         refName="modalBody"
-                        className={`${prefix}modal-body ${typeof body === "string" ? prefix+"alert-text" : ""}`}
+                        className={`${prefix}modal-body ${typeof body === "string" ? prefix + "alert-text" : ""}`}
                         {...bodyVisible}>
                         {body}
                     </div>
@@ -169,18 +182,6 @@ function AlertModal({ id, large, title, footer, dismissible, body }: AlertProps)
                 </div>
             </div>
         </div>
-    );
-}
-
-function AlertButton({ text, style }: { text: string; style?: string }) {
-    return (
-        <button
-            refName="alertBtn"
-            type="button"
-            className={`${prefix}btn ${prefix}btn-${style || "default"}`}
-            data-dismiss="modal">
-            {text}
-        </button>
     );
 }
 
@@ -197,12 +198,14 @@ interface Elements {
 
 class Modal extends EventEmitter {
     static options = DEFAULT_OPTIONS;
+    static _activeAlerts: Modal[] = [];
 
     el: HTMLElement;
     backdrop: HTMLElement;
     elements: Elements;
     content: HTMLDivElement;
-    buttons: HTMLButtonElement[];
+    _showFns: (() => pyObject | Suspension)[];
+    _hideFns: (() => pyObject | Suspension)[];
     _events: Events = {
         keydownHandler: () => {},
         mousedownHandler: () => {},
@@ -221,24 +224,62 @@ class Modal extends EventEmitter {
         setPrefix();
 
         const o = (this._options = Object.assign({}, Modal.options, options));
+        o.showFooter ||= o.buttons.length > 0;
 
-        const [el, elements] = (<AlertModal {...o} footer={!!o.buttons.length} />) as [HTMLElement, JSX.Refs];
+        const [el, elements] = (<AlertModal {...o} />) as [HTMLElement, JSX.Refs];
         this.el = el;
         this.elements = elements as unknown as Elements;
 
         const backdrop = (this.backdrop = document.createElement("div"));
         backdrop.className = `${prefix}modal-backdrop`;
 
-        const { modalFooter, modalContent } = elements as unknown as Elements;
+        this.content = this.elements.modalContent;
+        // placeholders
+        this._showFns = [];
+        this._hideFns = [];
+    }
+    static async create(options: Partial<typeof DEFAULT_OPTIONS> = {}) {
+        const modal = new Modal(options);
+        await modal.setup();
+        return modal;
+    }
+    async setup() {
+        // creates the python buttons
+        const modalFooter = this.elements.modalFooter;
+        const buttonDefs = this._options.buttons;
+        const hideFns = [];
+        const showFns = [];
 
-        this.content = modalContent;
-        this.buttons = [];
+        const pyButtonPanel = await asyncToPromise(() => pyCallOrSuspend<Component>(anvilMod["HtmlTemplate"]));
+        const buttonPanelElement = await asyncToPromise(pyButtonPanel.anvil$hooks.setupDom);
 
-        for (const { text, style, onClick } of o.buttons) {
-            const [btnEl] = (<AlertButton text={text} style={style} />) as [HTMLButtonElement, JSX.Refs];
-            this.buttons.push(btnEl);
-            modalFooter.appendChild(btnEl);
+        buttonPanelElement.classList.add("anvil-alert-footer-button-panel");
+
+        const buttonClass = anvilMod["pluggable_ui"].mp$subscript(s_alert_footer_buttons);
+
+        for (const { text, style, onClick } of buttonDefs) {
+            const pyButton = await asyncToPromise(() =>
+                pyCallOrSuspend<Component>(
+                    buttonClass,
+                    [],
+                    ["text", new pyStr(text), "button_type", new pyStr(style || "default")]
+                )
+            );
+            const hideOnClick = () => {
+                onClick?.();
+                this.hide();
+            };
+            await asyncToPromise(() => addEventHandler(pyButton, s_click, hideOnClick));
+            await asyncToPromise(() => pyCallOrSuspend(pyButtonPanel.tp$getattr(s_add_component), [pyButton]));
         }
+
+        modalFooter.append(buttonPanelElement);
+
+        hideFns.push(() => notifyComponentUnmounted(pyButtonPanel, true));
+        showFns.push(() => notifyComponentMounted(pyButtonPanel, true));
+
+        this._showFns = showFns;
+        this._hideFns = hideFns;
     }
 
     _setEvents() {
@@ -253,15 +294,6 @@ class Modal extends EventEmitter {
 
         this._events.resizeHandler = this._handleResize.bind(this);
         window.addEventListener("resize", this._events.resizeHandler);
-
-        const buttonDefs = this._options.buttons;
-        const buttons = this.buttons;
-
-        for (let i = 0; i < buttons.length; i++) {
-            const { onClick } = buttonDefs[i];
-            if (!onClick) continue;
-            buttons[i].addEventListener("click", onClick);
-        }
     }
 
     _handleMousedown(e: MouseEvent) {
@@ -332,18 +364,25 @@ class Modal extends EventEmitter {
         }
         setTimeout(callback, BACKDROP_TRANSITION);
     }
+    _createButtons() {}
 
-    show() {
+    async show() {
         if (this._isShown) {
             return;
         }
-
 
         this._setEvents();
         this._checkScrollbar();
         this._setScrollbar();
 
         document.body.classList.add(`${prefix}modal-open`);
+        KNOWN_ELEMENTS_TO_INERT.forEach((id) => {
+            document.getElementById(id)?.setAttribute("inert", "");
+        });
+        Modal._activeAlerts.forEach((modal) => {
+            modal.elements.modal.setAttribute("inert", "");
+        });
+        Modal._activeAlerts.push(this);
 
         const el = this.el;
         el.style.display = "block";
@@ -355,16 +394,21 @@ class Modal extends EventEmitter {
         if (!el.isConnected) {
             document.body.appendChild(el);
         }
-
-        this.emit("show", this);
         this._isShown = true;
+
         this._showBackdrop(() => this._showElement());
+
+        // do this after show backdrop otherwise the backdrop flashes oddly
+        (document.activeElement as HTMLElement)?.blur?.();
+        this.elements.modalDialog.focus();
+        await asyncToPromise(() => chainOrSuspend(null, ...this._showFns));
+        await this.emit("show", this);
 
         return this;
     }
 
-    toggle() {
-        return this._isShown ? this.hide() : this.show();
+    async toggle() {
+        return await (this._isShown ? this.hide() : this.show());
     }
 
     _resize() {
@@ -374,15 +418,16 @@ class Modal extends EventEmitter {
         el.style.paddingRight = this._bodyIsOverflowing && !modalIsOverflowing ? this._scrollbarWidth + "px" : "";
     }
 
-    hide() {
+    async hide() {
         if (!this._isShown) {
             return;
         }
         const o = this._options;
         const backdrop = this.backdrop;
         const elClassList = this.el.classList;
-        this.emit("hide", this);
         this._isShown = false;
+
+        this.emit("hide", this);
 
         elClassList.remove(ANIMATE_IN_CLASS);
 
@@ -391,9 +436,19 @@ class Modal extends EventEmitter {
         }
 
         this._removeEvents();
+        Modal._activeAlerts = Modal._activeAlerts.filter((x) => x !== this);
+        if (!Modal._activeAlerts.length) {
+            document.body.classList.remove(`${prefix}modal-open`);
+            KNOWN_ELEMENTS_TO_INERT.forEach((id) => {
+                document.getElementById(id)?.removeAttribute("inert");
+            });
+        } else {
+            const active = Modal._activeAlerts[Modal._activeAlerts.length - 1];
+            active.elements.modal.removeAttribute("inert");
+            active.elements.modalDialog.focus();
+        }
 
         setTimeout(() => {
-            document.body.classList.remove(`${prefix}modal-open`);
             document.body.style.paddingRight = this._originalBodyPad;
         }, BACKDROP_TRANSITION);
 
@@ -402,6 +457,7 @@ class Modal extends EventEmitter {
                 backdrop.remove();
             }
             this.el.style.display = "none";
+            asyncToPromise(() => chainOrSuspend(null, ...this._hideFns));
             this.emit("hidden", this);
             this.el.remove();
         }, TRANSITION);
@@ -417,15 +473,6 @@ class Modal extends EventEmitter {
         this.el.removeEventListener("click", this._events.clickHandler);
 
         window.removeEventListener("resize", this._events.resizeHandler);
-
-        const buttonDefs = this._options.buttons;
-        const buttons = this.buttons;
-
-        for (let i = 0; i < buttons.length; i++) {
-            const { onClick } = buttonDefs[i];
-            if (!onClick) continue;
-            buttons[i].removeEventListener("click", onClick);
-        }
     }
 
     _checkScrollbar() {

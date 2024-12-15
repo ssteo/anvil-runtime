@@ -7,12 +7,6 @@ from . import _config
 from ._errors import NoSuchColumnError, QuotaExceededError, RowDeleted, TableError, TransactionConflict
 from ._helpers import _hash_wrapper
 
-# Hack: Force ourselves into the top-level package, even
-# if we were loaded into a runtime-v1 per-app Anvil package
-__package__ = "anvil.tables"
-__name__ = "anvil.tables"
-
-
 # Use old app tables by default
 class AppTables(object):
     cache = None
@@ -109,6 +103,9 @@ def _clear_cache():
     _set_class(app_tables, _LazyAppTables)
 
 
+anvil.server._on_invalidate_client_objects(_clear_cache)
+
+
 #!defModuleAttr(anvil.tables)!1:
 # {
 # 	name: "app_tables",
@@ -171,7 +168,11 @@ class Transaction:
 # anvil$helpLink: "/docs/data-tables/transactions"
 #  } ["in_transaction"]
 def in_transaction(maybe_f=None, relaxed=None):
+    # we don't want to import this on the client unnecessarily
+    import functools
+
     def wrap(f):
+        @functools.wraps(f)
         def new_f(*args, **kwargs):
             n = 0
             while True:
@@ -199,8 +200,6 @@ def in_transaction(maybe_f=None, relaxed=None):
             pass
         else:
             reregister(new_f)
-
-        new_f.__name__ = f.__name__
 
         return new_f
 

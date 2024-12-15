@@ -1,5 +1,6 @@
-import { anvilServerMod, defer, Deferred, generateUUID, globalSuppressLoading } from "@runtime/utils";
-import { Args, Kws, promiseToSuspension, pyStr } from "@Sk";
+import { defer, Deferred, generateUUID, globalSuppressLoading } from "@runtime/utils";
+import { anvilServerMod } from "@runtime/runner/py-util";
+import { Args, Kws, promiseToSuspension, pyStr, Suspension } from "@Sk";
 import PyDefUtils from "PyDefUtils";
 import { diagnosticData, diagnosticRequest } from "./diagnostics";
 import { ErrorData, ResponseData } from "./handlers";
@@ -47,11 +48,30 @@ type OutstandingRequests = {
 };
 
 export const outstandingRequests: OutstandingRequests = {};
-
+export const requestSuspensions: Record<string, Suspension> = {};
+export let onServerCallResponse: ((resp: ResponseData) => void) | null = null;
+export let modifyOutgoingServerCall: ((call: any) => void) | null = null;
 export const getNumOutstandingRequests = () => Object.keys(outstandingRequests).length;
+
+let requestReloadEnvOnNextCall = false;
+
+export const reloadEnvOnNextCall = () => {
+    requestReloadEnvOnNextCall = true;
+};
 
 let heartbeatTimeout: number | undefined;
 let heartbeatCount = 0;
+
+export const registerServerCallSuspension = (s: Suspension<{ serverRequestId: string }>) => {
+    requestSuspensions[s.data.serverRequestId] = s;
+};
+
+export const setOnServerCallResponse = (handler: (resp: ResponseData) => void) => {
+    onServerCallResponse = handler;
+};
+export const setModifyOutgoingServerCall = (handler: (call: any) => void) => {
+    modifyOutgoingServerCall = handler;
+};
 
 async function heartbeat() {
     try {
@@ -76,6 +96,7 @@ export const incHeartbeatCount = () => heartbeatCount++;
 
 export function deleteOutstandingRequest(requestId: string) {
     delete outstandingRequests[requestId];
+    delete requestSuspensions[requestId];
     if (Object.keys(outstandingRequests).length == 0) {
         clearTimeout(heartbeatTimeout);
         heartbeatTimeout = undefined;
@@ -104,6 +125,11 @@ export function createRequestTemplate(
     const knownLiveObjectInstances: KnownLiveObjectInstances = {};
     const blobContent: BlobContent[] = []; // array of arrays: [[{json: chunk header, data: DataView}...]]
     const callObjToSerialize = { type: "CALL", id: requestId, args, kwargs };
+    modifyOutgoingServerCall?.(callObjToSerialize);
+    if (requestReloadEnvOnNextCall) {
+        callObjToSerialize.reload_env = true;
+        requestReloadEnvOnNextCall = false;
+    }
 
     const call = serialize(callObjToSerialize, requestId, {
         knownCapabilities,
@@ -325,5 +351,7 @@ export function doRpcCall(
     const { deferred } = request;
     callExecuter ??= executeCall;
     callExecuter(request, serializedCallPromise, blobContent, suppressLoading);
-    return promiseToSuspension(deferred.promise);
+    const suspension = promiseToSuspension(deferred.promise);
+    suspension.data.serverRequestId = request.id;
+    return suspension;
 }

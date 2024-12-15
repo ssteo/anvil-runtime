@@ -1,7 +1,7 @@
 "use strict";
 
 var PyDefUtils = require("PyDefUtils");
-const { datetimeMod, tzMod } = require("../utils");
+const { datetimeMod, tzMod } = require("@runtime/runner/py-util");
 const { getCssPrefix } = require("@runtime/runner/legacy-features");
 
 /*#
@@ -177,7 +177,7 @@ module.exports = (pyModule) => {
     }
 
     pyModule["DatePicker"] = PyDefUtils.mkComponentCls(pyModule, "DatePicker", {
-        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(DatePicker)!2*/ ["text", "layout", "interaction", "appearance", "tooltip", "user data"], {
+        properties: PyDefUtils.assembleGroupProperties(/*!componentProps(DatePicker)!2*/ ["text", "layout", "layout_margin", "interaction", "appearance", "tooltip", "user data"], {
             foreground: {
                 set: (s, e, v) => {
                     s._anvil.elements.input.style.color = s._anvil.elements.icon.style.color = PyDefUtils.getColor(v);
@@ -282,6 +282,7 @@ module.exports = (pyModule) => {
                 set(s, e, v) {
                     updatePicker(s);
                 },
+                important: true,
             },
 
             /*!componentProp(DatePicker)!1*/
@@ -319,6 +320,7 @@ module.exports = (pyModule) => {
                 set(s, e, v) {
                     s._anvil.elements.input.setAttribute("placeholder", isTrue(v) ? v.toString() : "");
                 },
+                important: true,
             },
         }),
 

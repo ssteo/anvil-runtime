@@ -23,8 +23,7 @@ import {
     pyDict,
 } from "./@Sk";
 import Modal from "./modules/modal";
-import { anvilMod, anvilServerMod } from "./utils";
-import {s_add_event_handler, s_raise_event} from "@runtime/runner/py-util";
+import { anvilMod, anvilServerMod, s_add_event_handler, s_raise_event} from "@runtime/runner/py-util";
 
 if (navigator.userAgent.indexOf("Trident/") > -1) {
     window.isIE = true;
@@ -150,7 +149,7 @@ function onResize(e) {
 }
 
 // Load an app, but don't open the main form or module
-function loadApp(app, appId, appOrigin, preloadModules) {
+function loadApp(app, appId, appOrigin) {
 
     window.setLoading(true);
 
@@ -483,12 +482,12 @@ function loadApp(app, appId, appOrigin, preloadModules) {
             .animate({ "padding-left": 20, "padding-right": 20, right: 20 }, 1000); //.css("opacity", "1").animate({opacity: 0.7}, 1000);
     };
 
-    const showRefreshSessionModal = () => {
+    const showRefreshSessionModal = async () => {
         if (document.getElementById("session-expired-modal")) {
             // we're already on the screen
             return;
         }
-        const modal = new Modal({
+        const modal = await Modal.create({
             id: "session-expired-modal",
             large: false,
             title: "Session Expired",
@@ -1093,7 +1092,7 @@ function loadApp(app, appId, appOrigin, preloadModules) {
 
     window.anvilServiceClientConfig = {}; // {path => config}
     for (let appService of app.services) {
-        var serviceSource = appService.source.replace(/^\/runtime/, window.anvilCDNOrigin + "/runtime");
+        var serviceSource = appService.source.replace(/^\/runtime/, window.anvilAppOrigin + "/_/static/runtime");
         var m = /((.*\/)([^/]*))\.yml/g.exec(serviceSource);
         var serviceName = m[3];
         var serviceUrl = m[1];
@@ -1138,16 +1137,6 @@ function loadApp(app, appId, appOrigin, preloadModules) {
     PyDefUtils.loadModule("anvil.media", mediaModule);
 
     PyDefUtils.loadModule("anvil.code_completion_hints", require("./modules/code-completion-hints")());
-
-    try {
-        Sk.misceval.retryOptionalSuspensionOrThrow(Sk.importModule("anvil.tables", false, true));
-    } catch (e) {
-        console.log("Failed to preload anvil.tables", e);
-    }
-
-    for (let pm of (preloadModules || [])) {
-        Sk.misceval.retryOptionalSuspensionOrThrow(Sk.importModule(pm, false, true));
-    }
 
     // Runtime v1 and below uses a really grotty mechanism for getting templates.
     // We use prototypical inheritance to give each app a slightly different
@@ -1294,7 +1283,7 @@ window.setLoading = function(loading) {
 
 var appLoaded = false;
 
-window.loadApp = function(params, preloadModules) {
+window.loadApp = function(params) {
     window.anvilParams = params;
 
     var appOrigin = params["appOrigin"];
@@ -1308,7 +1297,7 @@ window.loadApp = function(params, preloadModules) {
 
 
 
-    var appLoadPromise = loadApp(params["app"], params["appId"], appOrigin, preloadModules);
+    var appLoadPromise = loadApp(params["app"], params["appId"], appOrigin);
     appLoaded = true;
 
     if (window.anvilOnLoadApp) {
@@ -1355,9 +1344,6 @@ window.anvil = {
                 $(jsThis).trigger("_anvil-call", [resolve, reject].concat(args));
             });
         }
-    },
-    enableLegacy() {
-        // noop
     },
 };
 

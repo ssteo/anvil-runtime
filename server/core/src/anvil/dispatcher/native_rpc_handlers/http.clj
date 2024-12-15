@@ -45,9 +45,20 @@
     (let [uri (URI/create url)]
       (if (or (.getQuery uri) (not (string? data)))
         url
-        (str (URI. (.getScheme uri) (.getAuthority uri) (.getPath uri) data (.getFragment uri)))))
+        (str (URI. (.getScheme uri) (.getAuthority uri) (.getPath uri) nil) "?" data (when-let [hash (.getRawFragment uri)]
+                                                                                       (str "#" hash)))))
     (catch Exception _e
       url)))
+
+(
+  comment
+  ;; the data is already encoded - want to ensure this doesn't get double encoded
+  ;; https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMax=2024-04-01T00%3A00%3A00Z
+  (replace-query "https://www.googleapis.com/calendar/v3/calendars/primary/events" "timeMax=2024-04-01T00%3A00%3A00Z")
+  ;; and hash is preserved
+  ;; https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMax=2024-04-01T00%3A00%3A00Z#foo
+  (replace-query "https://www.googleapis.com/calendar/v3/calendars/primary/events#foo" "timeMax=2024-04-01T00%3A00%3A00Z")
+  )
 
 (defn- has-content [method]
   (and (not= method :get) (not= method :head)))
@@ -56,7 +67,8 @@
   (when u/*client-request?*
     (throw+ {:anvil/server-error "Cannot call this function from client code", :type "anvil.server.PermissionDenied"}))
   (worker-pool/with-expanding-threadpool-when-slow
-    (let [method (keyword (.toLowerCase (or method "GET")))
+    (let [start-time (System/currentTimeMillis)
+          method (keyword (.toLowerCase (or method "GET")))
           headers (reduce merge {} (for [[k v] headers]
                                      {(.substring (.toLowerCase (str k)) 1) v}))
           headers (if username
@@ -101,6 +113,7 @@
                                                          @(http/request httpkit-map nil))]
 
       (log/trace resp)
+      (log/debug (str "anvil.private.http.request from app " u/*app-id* " to " url " took " (- (System/currentTimeMillis) start-time) "ms"))
 
       (when error
         (throw+ (general-http-error "anvil.http.HttpRequestFailed"
